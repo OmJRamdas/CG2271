@@ -1,4 +1,9 @@
 /*
+ * SUPERSEDED: replaced by mcx/source/ (cg2271project_v1.c + protocol.c/.h).
+ * Kept for reference only. Its pins (servo PTD0, buzzer PTD4, pot PTB0) and
+ * GAME:/SENSOR: protocol are outdated. See README "MCXC444 wiring" and
+ * "UART Protocol".
+ *
  * CG2271 Assignment 4 — MCXC444 Flight Game Controller
  * Replace the application .c file in your existing FreeRTOS project.
  *

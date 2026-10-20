@@ -38,24 +38,25 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
  │              FRDM-MCXC444 (FreeRTOS)                   │
  │                                                        │
  │  Tasks:                                                │
- │    communicationTask (pri 2) — UART RX/TX, parsing     │
- │    ledTask           (pri 1) — red LED control          │
- │    buzzerTask        (pri 1) — buzzer control           │
- │    sensorTask        (pri 1) — ADC polling (LDR)        │
- │    servoTask         (pri 1) — servo PWM control        │
+ │    commRxTask (pri 3) — parse frames, ACK/NAK, state   │
+ │    commTxTask (pri 2) — sole owner of UART TX          │
+ │    ldrTask    (pri 2) — LDR ADC polling, report        │
+ │    ledTask    (pri 1) — red LED patterns               │
+ │    buzzerTask (pri 1) — buzzer tunes (TPM1 PWM)        │
+ │    servoTask  (pri 1) — lives gauge (TPM0 PWM)         │
  │                                                        │
  │  Sync:                                                 │
- │    Queues: uartRxQueue, ledQueue, buzzerQueue,         │
- │            servoQueue                                  │
- │    Mutex:  gameStateMutex (protects shared state)      │
+ │    Queues: rxQueue, txQueue, ledQueue, buzzerQueue     │
+ │    Mutex:  gameStateMutex, printMutex                  │
+ │    Binary semaphore: txDoneSem                         │
  │                                                        │
  │  Actuators:                                            │
  │    - Red LED    PTE31  (onboard, active-LOW)           │
- │    - Buzzer     PTD4   (external, active-HIGH)         │
- │    - Servo SG90 PTD0   (external, PWM)                 │
+ │    - Buzzer     PTA12  D3 (external, passive, PWM)     │
+ │    - Servo SG90 PTA5   D5 (external, PWM)              │
  │                                                        │
  │  Sensor:                                               │
- │    - LDR (photoresistor) on ADC channel (e.g. PTB0)   │
+ │    - LDR (photoresistor) PTB2 A2 (ADC0_SE12)           │
  └────────────────────────────────────────────────────────┘
 ```
 
@@ -68,71 +69,129 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | 1 | GY-521 MPU-6050 | ESP32-S2 | I2C (SDA/SCL) | Polled (~30 Hz) | Tilt → pitch & roll of airplane |
 | 2 | Joystick module | ESP32-S2 | 2× ADC + 1 GPIO | Polled (ADC), interrupt (button) | Throttle (Y-axis), yaw (X-axis) |
 | 3 | Push button | ESP32-S2 | GPIO | Interrupt (falling edge) | Fire / boost |
-| 4 | LDR (photoresistor) | MCXC444 | ADC | Polled (sensorTask) | Stealth mode — cover to dim lights |
+| 4 | LDR (photoresistor) | MCXC444 | ADC0_SE12, PTB2 (A2) | Polled (ldrTask, 100 ms) | Stealth mode — cover to dim lights |
 
 ### Actuators (3 required)
 
 | # | Actuator | Connected to | Pin | Type | Purpose |
 |---|----------|--------------|-----|------|---------|
-| 1 | Red LED | MCXC444 | PTE31 (onboard) | GPIO, active-LOW | Damage / warning indicator |
-| 2 | Active buzzer | MCXC444 | PTD4 (external) | GPIO, active-HIGH | Collision / fire sound |
-| 3 | Servo SG90 | MCXC444 | PTD0 (external) | PWM | Physical "wing flap" / tilt indicator |
+| 1 | Red LED | MCXC444 | PTE31 (onboard) | GPIO, active-LOW | Game mode / hit / link-lost indicator |
+| 2 | Passive buzzer | MCXC444 | PTA12, header D3 | TPM1_CH0 PWM (tone) | A tune per game event |
+| 3 | Servo SG90 | MCXC444 | PTA5, header D5 | TPM0_CH2 PWM, 50 Hz | Lives gauge (0 lives = 0°, 3 = 180°) |
 
-## UART Protocol (Bi-directional, 9600 baud)
+### MCXC444 wiring
 
-### ESP32 → MCXC444
+| Signal | MCX pin | Header | Connect to |
+|---|---|---|---|
+| UART2 TX | PTE22 | — | ESP32 Serial1 RX |
+| UART2 RX | PTE23 | — | ESP32 Serial1 TX |
+| GND | GND | — | ESP32 GND (common ground is required) |
+| Servo signal | PTA5 | D5 | SG90 orange wire (power the servo from 5 V, GND shared) |
+| Buzzer signal | PTA12 | D3 | buzzer S pin (VCC → 3.3 V, GND → GND) |
+| LDR | PTB2 | A2 | 3.3 V — LDR — A2 — 10 kΩ — GND |
+
+The pins were chosen from the MCXC444 reference manual's pin-mux table and the FRDM schematic (`mcx/extras/`). PTD0/PTD4/PTE20/PTE21 are shared with the onboard LCD, and PTB0/PTB1 go to the MCU-Link I2C bus, so all of those are avoided.
+
+## UART Protocol (Bi-directional, 9600 baud 8N1)
+
+Source of truth: [mcx/source/protocol.h](mcx/source/protocol.h). One ASCII frame per line:
 
 ```
-GAME:<event>,<value>\n
+$<TYPE>,<seq>,<fields...>*<CK>\n
 ```
 
-| Message | Meaning |
-|---------|---------|
-| `GAME:HIT,1` | Player was hit — flash red LED + buzzer beep |
-| `GAME:HIT,0` | Damage cleared |
-| `GAME:BOOST,1` | Boost active — buzzer tone |
-| `GAME:BOOST,0` | Boost ended |
-| `GAME:ROLL,<deg>` | Current roll angle — servo mirrors it |
-| `GAME:SCORE,<n>` | Score update — LED pattern |
+- `seq` is 0–65535. The sender increments it for every frame and wraps to 0.
+- `CK` is two hex digits: the XOR of every byte between `$` and `*` (the same scheme as NMEA). Example: `$ACK,12*66`.
+- Frames are at most 64 characters, not counting `\n`. A trailing `\r` is tolerated.
+
+### ESP32 → MCXC444 (game state from the cloud)
+
+| Frame | Meaning |
+|---|---|
+| `$GS,<seq>,<lives 0-99>,<score 0-9999999>,<IDLE\|PLAY\|OVER>*CK` | Current game state. Send at least every 500 ms (it also serves as the heartbeat). |
+| `$EV,<seq>,<HIT\|START\|OVER\|BONUS>*CK` | One-off game event. Send it once, when it happens. |
 
 ### MCXC444 → ESP32
 
-```
-SENSOR:LDR,<raw_adc>\n
-ACK:<event>\n
-```
+| Frame | Meaning |
+|---|---|
+| `$ACK,<seq>*CK` | Frame `<seq>` was valid and has been applied |
+| `$NAK,<seq>*CK` | Frame `<seq>` was rejected (bad checksum, bad format or out-of-range value). The ESP32 can resend it. `seq` is 0 if it couldn't be read. |
+| `$LDR,<seq>,<raw 0-4095>,<dark 0/1>*CK` | Light sensor reading: every 200 ms, and immediately when dark/light changes |
 
-| Message | Meaning |
-|---------|---------|
-| `SENSOR:LDR,<value>` | LDR reading for stealth mode logic |
-| `ACK:HIT` | Acknowledge received event |
+### Flow control
 
-## FreeRTOS Design
+- **Every frame is acknowledged.** The ESP32 can resend on `NAK`, or when no `ACK` arrives within ~200 ms.
+- **Link watchdog:** if the MCX gets no valid frame for 2 s, it marks the link as lost and the red LED slow-blinks. The link recovers automatically on the next valid frame.
+
+### What the MCXC444 does with it
+
+| Input | Red LED | Buzzer | Servo |
+|---|---|---|---|
+| mode `IDLE` | short blip every 2 s | — | follows lives |
+| mode `PLAY` | solid on | — | follows lives |
+| mode `OVER` | 5 Hz blink | — | 0° |
+| `EV HIT` | triple flash | falling two-note tune | — |
+| `EV BONUS` | double flash | rising two-note tune | — |
+| `EV START` / `EV OVER` | mode changes immediately | start / game-over tune | — |
+| link lost (2 s silence) | 1 Hz blink | — | holds position |
+
+## FreeRTOS Design (MCXC444)
+
+Code: [mcx/source/cg2271project_v1.c](mcx/source/cg2271project_v1.c). The kernel config is [mcx/FreeRTOSConfig_Gen.h](mcx/FreeRTOSConfig_Gen.h): copy it into the MCUXpresso project's `freertos/freertos-kernel/template/ARM_CM0/`.
 
 ### Tasks
 
-| Task | Priority | Stack | Role |
+| Task | Priority | Stack (words) | Role |
 |------|----------|-------|------|
-| `communicationTask` | 2 | MINIMAL+200 | UART RX parsing, TX responses, updates shared game state via mutex |
-| `ledTask` | 1 | MINIMAL+100 | Reads ledQueue, drives red LED with patterns (flash, solid, off) |
-| `buzzerTask` | 1 | MINIMAL+100 | Reads buzzerQueue, drives buzzer (beep patterns) |
-| `sensorTask` | 1 | MINIMAL+100 | Polls LDR via ADC every 200 ms, sends reading over UART TX |
-| `servoTask` | 1 | MINIMAL+100 | Reads servoQueue, sets servo PWM angle |
+| `commRxTask` | 3 | MINIMAL+200 | Parses and validates frames from `rxQueue`; ACKs or NAKs each one; updates `GameState` under the mutex; dispatches events to the actuator tasks; runs the 2 s link watchdog |
+| `commTxTask` | 2 | MINIMAL+80 | The only task that writes to UART2: takes a frame from `txQueue`, starts the interrupt-driven send, then waits on `txDoneSem` |
+| `ldrTask` | 2 | MINIMAL+200 | Every 100 ms: starts an ADC conversion and waits for the ISR's notification. Applies a 4-sample moving average and dark/light hysteresis, then queues `$LDR` |
+| `ledTask` | 1 | MINIMAL+40 | Flash patterns from `ledQueue`; otherwise shows the mode or link state |
+| `buzzerTask` | 1 | MINIMAL+40 | Plays a tune per event from `buzzerQueue`. The tone comes from TPM1 hardware PWM, so pitch doesn't depend on task timing |
+| `servoTask` | 1 | MINIMAL+40 | Lives gauge with slew limiting, updated every 50 ms |
 
-### Synchronization
+### ISRs
 
-- **Queues** (length 1, overwrite): `ledQueue`, `buzzerQueue`, `servoQueue` — latest command wins.
-- **Queue** (length 5): `uartRxQueue` — buffered incoming UART messages.
-- **Mutex**: `gameStateMutex` — protects a shared `GameState` struct written by `communicationTask`, read by actuator tasks for coordinated behavior.
+Both ISRs are short and never block. They use only FromISR APIs, and the ISR never waits for input.
 
-### RTOS Demonstration
+- **`UART2_FLEXIO_IRQHandler`** (NVIC priority 1)
+  - Receive: assembles characters into a line, discards lines that overflow or have UART errors, and hands complete lines over with `xQueueSendFromISR`.
+  - Send: while TIE is set, sends `txBuf` one character per TDRE (as in the AS03 pattern), then gives `txDoneSem`.
+- **`ADC0_IRQHandler`** (NVIC priority 2): reads the conversion result and wakes `ldrTask` with `vTaskNotifyGiveFromISR`.
 
-- **Time-slicing**: `ledTask`, `buzzerTask`, `sensorTask`, `servoTask` all at priority 1 — round-robin.
-- **Pre-emption**: `communicationTask` at priority 2 pre-empts all priority-1 tasks on UART data.
+### Synchronization & resource protection
 
-### ISR
+| Object | Type | Between | Protects / signals |
+|---|---|---|---|
+| `rxQueue` (5 × 66 B) | Queue | UART ISR → commRxTask | complete received lines |
+| `txQueue` (6 × 32 B) | Queue | commRx/ldr → commTxTask | outgoing frames, with UART TX owned by a single task |
+| `ledQueue`, `buzzerQueue` | Queue | commRxTask → actuators | event commands |
+| `gameStateMutex` | Mutex | commRx (writes) ↔ led/servo (read) | the shared `GameState` struct |
+| `printMutex` | Mutex | all tasks that log | the debug console (stops `PRINTF` output interleaving) |
+| `txDoneSem` | Binary semaphore | UART ISR → commTxTask | "frame sent", so `txBuf` can be reused |
+| task notification | Notification | ADC ISR → ldrTask | "conversion done" (lighter than a semaphore) |
 
-- `UART2_FLEXIO_IRQHandler`: character-by-character UART RX, enqueues complete messages. Non-blocking, uses `xQueueSendFromISR`. Set to lowest NVIC priority.
+### RTOS configuration (`FreeRTOSConfig_Gen.h`)
+
+- **Scheduling:** `configUSE_PREEMPTION 1` and `configUSE_TIME_SLICING 1`. `led`, `buzzer` and `servo` share priority 1 and round-robin. `commRxTask` (priority 3) pre-empts everything as soon as the ISR queues a line.
+- **Tick:** `configTICK_RATE_HZ 1000`, a 1 ms tick so `pdMS_TO_TICKS` delays are exact.
+- **Removed (unused):** software timers and the timer task, recursive mutexes, counting semaphores, the trace facility, the queue registry, and the `vTaskDelete`, `vTaskPrioritySet`, `uxTaskPriorityGet`, `xTaskResumeFromISR` and `xTimerPendFunctionCall` APIs.
+- **Added (safety):** `configCHECK_FOR_STACK_OVERFLOW 2` and `configUSE_MALLOC_FAILED_HOOK 1`. Both hooks stop the system with the red LED solid on.
+
+### Testing without hardware
+
+```sh
+# protocol unit tests (any host gcc, e.g. MSYS2)
+cd mcx/tests && gcc -std=c11 -Wall -Wextra -I../source test_protocol.c ../source/protocol.c -o test_protocol && ./test_protocol
+
+# ESP32 simulator against the real board (USB-UART adapter on PTE22/PTE23/GND)
+py -m venv .venv && .venv\Scripts\python -m pip install pyserial
+.venv\Scripts\python mcx\tools\esp32_sim.py --list
+.venv\Scripts\python mcx\tools\esp32_sim.py COM7               # scripted game
+.venv\Scripts\python mcx\tools\esp32_sim.py COM7 --corrupt 3   # every 3rd frame corrupted, expect NAK
+.venv\Scripts\python mcx\tools\esp32_sim.py COM7 --interactive
+```
 
 ## Cloud / Online Function
 
@@ -163,14 +222,14 @@ ACK:<event>\n
 | 3 actuators | ✅ | Red LED, buzzer, servo |
 | ≥1 sensor on MCXC444 | ✅ | LDR on MCXC444 ADC |
 | ≤1 onboard actuator | ✅ | Red LED only; buzzer + servo external |
-| Polling + interrupt | ✅ | ADC polling (LDR, joystick); interrupt (UART, button) |
-| ≥1 ISR | ✅ | UART2 ISR |
-| ≥3 tasks | ✅ | 5 tasks |
-| ≥1 mutex/semaphore | ✅ | gameStateMutex |
-| ≥1 queue | ✅ | 4+ queues |
-| Time-slicing | ✅ | 4 tasks at priority 1 |
-| Pre-emption | ✅ | communicationTask at priority 2 |
-| Bi-directional UART | ✅ | ESP32→MCX (game events), MCX→ESP32 (LDR + ACK) |
+| Polling + interrupt | ✅ | Polled: LDR (ldrTask, 100 ms) and the ESP32's MPU-6050. Interrupt-driven: the ESP32's button/touch sensor |
+| ≥1 ISR | ✅ | UART2 ISR (RX + TX) and ADC0 ISR on the MCXC444 |
+| ≥3 tasks | ✅ | 6 tasks |
+| ≥1 mutex/semaphore | ✅ | gameStateMutex, printMutex, txDoneSem (binary) |
+| ≥1 queue | ✅ | rxQueue, txQueue, ledQueue, buzzerQueue |
+| Time-slicing | ✅ | `configUSE_TIME_SLICING 1`; led/buzzer/servo share priority 1 |
+| Pre-emption | ✅ | `configUSE_PREEMPTION 1`; commRxTask (priority 3) pre-empts the other tasks |
+| Bi-directional UART | ✅ | ESP32→MCX: `$GS`/`$EV`. MCX→ESP32: `$LDR` and `$ACK`/`$NAK`. Frames are checksummed, sequenced and acknowledged |
 | Cloud/internet | ✅ | ESP32 WebSocket client → cloud relay |
 | Non-trivial online | ✅ | Real-time game data exchange |
 | Coherent product | ✅ | All sensors/actuators serve the flight game |
@@ -192,12 +251,12 @@ ACK:<event>\n
 - Handle reconnection on WiFi drop.
 
 ### Stream 3 — MCXC444 FreeRTOS Firmware
-- UART RX (already done) + add UART TX function.
-- Parse `GAME:` protocol messages.
-- Add `sensorTask` for LDR ADC polling.
-- Add `servoTask` for PWM servo control.
-- Add `gameStateMutex` for shared state protection.
-- Transmit `SENSOR:LDR,<val>` back to ESP32.
+- ✅ UART RX and TX, both interrupt-driven, using the checksummed frame protocol (`$GS`/`$EV` in, `$ACK`/`$NAK`/`$LDR` out).
+- ✅ LDR polling task with an interrupt-driven ADC, smoothing and hysteresis.
+- ✅ LED, buzzer (TPM1 tone) and servo (TPM0 lives gauge) tasks.
+- ✅ gameStateMutex, printMutex, txDoneSem, 4 queues; time-slicing and pre-emption on; unused kernel features off.
+- ✅ Host unit tests (`mcx/tests`) and the ESP32 simulator (`mcx/tools/esp32_sim.py`).
+- ⏳ On-hardware verification with the simulator, then integration with the ESP32.
 
 ### Stream 4 — Cloud Relay Server
 - Build Node.js WebSocket relay (~30 lines, using `ws` library).
@@ -228,9 +287,14 @@ ACK:<event>\n
 ```
 CG2271/
 ├── README.md                  ← this file
-├── mcxc444/
-│   └── source/
-│       └── main.c             ← FreeRTOS firmware
+├── mcx/
+│   ├── source/                ← copy into the MCUXpresso project's source/
+│   │   ├── cg2271project_v1.c ← FreeRTOS firmware (tasks, ISRs, drivers)
+│   │   ├── protocol.c/.h      ← UART frame protocol (hardware-independent)
+│   ├── FreeRTOSConfig_Gen.h   ← kernel config (time-slicing etc.)
+│   ├── tests/test_protocol.c  ← host unit tests
+│   ├── tools/esp32_sim.py     ← ESP32 simulator for standalone testing
+│   └── extras/                ← reference manual, schematic, lab templates
 ├── esp32/
 │   └── flight_controller/
 │       └── flight_controller.ino  ← Arduino sketch
