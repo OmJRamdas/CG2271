@@ -1,7 +1,8 @@
 /*
  * SUPERSEDED: replaced by mcx/source/ (cg2271project_v1.c + protocol.c/.h).
- * Kept for reference only. Its pins (servo PTD0, buzzer PTD4, pot PTB0) and
- * GAME:/SENSOR: protocol are outdated. See README "MCXC444 wiring" and
+ * Kept for reference only. Its servo pin (PTD0, not on any header; the servo
+ * is now on PTA5) and its GAME:/SENSOR: protocol are outdated. Buzzer PTD4
+ * and PTB0 (now the LDR) are still used. See README "MCXC444 wiring" and
  * "UART Protocol".
  *
  * CG2271 Assignment 4 — MCXC444 Flight Game Controller
