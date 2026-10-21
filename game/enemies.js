@@ -215,8 +215,7 @@ class Enemy {
     S.kills++;
     S.waveEnemiesAlive--;
     addKillMsg('+10 ENEMY DOWN');
-    sendEvent('HIT', 1);
-    sendEvent('SCORE', S.score);
+    sendGameState();
   }
 
   remove() { scene.remove(this.mesh); }

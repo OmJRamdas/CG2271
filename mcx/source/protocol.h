@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #define PROTO_MAX_LINE      64U     /* longest frame, excluding '\n'   */
 #define PROTO_MAX_SEQ       65535L
@@ -58,6 +59,14 @@ typedef struct {
 /* XOR checksum over len bytes. */
 uint8_t proto_checksum(const char *s, size_t len);
 
+/* Zero-initialize this stop-and-wait retry history before its first use.
+ * Call only after a successful proto_parse().
+ * Returns false for an exact retry of the most recently accepted frame.
+ * ACK retries normally, but do not reapply their game state or event effects.
+ */
+typedef struct { char last_line[PROTO_MAX_LINE + 1U]; } proto_history_t;
+bool proto_remember(proto_history_t *history, const char *line);
+
 /*
  * Parse one received line (without the trailing '\n'; a trailing '\r' is
  * tolerated). On return *seq_out holds the frame's sequence number if it
@@ -68,7 +77,7 @@ proto_status_t proto_parse(const char *line, proto_msg_t *out, int32_t *seq_out)
 
 /*
  * Build a complete frame from a printf-style body, e.g.
- *     proto_build(buf, sizeof buf, "ACK,%u", seq)  ->  "$ACK,12*5B\n"
+ *     proto_build(buf, sizeof buf, "ACK,%u", seq)  ->  "$ACK,12*66\n"
  * Returns the frame length, or -1 if it does not fit.
  */
 int proto_build(char *buf, size_t size, const char *fmt, ...)

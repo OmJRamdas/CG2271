@@ -18,6 +18,18 @@ uint8_t proto_checksum(const char *s, size_t len)
     return ck;
 }
 
+bool proto_remember(proto_history_t *history, const char *line)
+{
+    size_t len = strlen(line);
+    if (len && line[len - 1] == '\r') len--;
+    if (len > PROTO_MAX_LINE) return false;
+    if (strlen(history->last_line) == len && !memcmp(history->last_line, line, len))
+        return false;
+    memcpy(history->last_line, line, len);
+    history->last_line[len] = '\0';
+    return true;
+}
+
 static int hexval(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';

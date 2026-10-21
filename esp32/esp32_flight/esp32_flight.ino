@@ -10,8 +10,8 @@
  *   Joystick (ADC)  → camera X / Y       (camera orbit)
  *   Push button     → fire               (GPIO interrupt)
  *
- * MCXC444 sends:  SENSOR:POT,<0..4095>\n   (potentiometer)
- * We forward:     GAME:<event>,<value>\n    (game events)
+ * MCXC444 sends: $LDR / $ACK / $NAK (see mcx/source/protocol.h).
+ * We send: $GS state heartbeats and $EV one-shot game events.
  *
  * UART wiring identical to Assignment 3:
  *   ESP32 GPIO1 TX  →  MCX PTE23 UART2 RX
@@ -20,6 +20,8 @@
  *
  * Required libraries (install via Arduino Library Manager):
  *   - WebSockets by Markus Sattler  (arduinoWebSockets)
+ *   - Adafruit MPU6050, Adafruit Unified Sensor, Adafruit BusIO
+ *   - ArduinoJson 7
  *   - (Wire.h is built-in)
  *
  * Board:  ESP32S2 Dev Module
@@ -30,7 +32,20 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
-#include <math.h>
+#include <ArduinoJson.h>
+#include <esp_random.h>
+#include "McxLink.h"
+#include "ButtonEvents.h"
+#include "TiltController.h"
+
+// Original accelerometer convention: +X -> +pitch, +Y -> +roll.
+// The new estimator uses aerospace pitch (-X), so invert only its output.
+static TiltConfig originalDirections() {
+  TiltConfig config;
+  config.pitchSign = -1.0f;
+  return config;
+}
+TiltController tilt(originalDirections());
 
 #if !defined(CONFIG_IDF_TARGET_ESP32S2)
 #error "Select 'ESP32S2 Dev Module' in Arduino IDE."
@@ -58,30 +73,12 @@ const uint16_t WS_PORT = 443;
 const char* WS_PATH    = "/";
 
 /* ════════════════════════════════════════════
- *  MPU-6050 REGISTERS
- * ════════════════════════════════════════════ */
-#define MPU_ADDR       0x68
-#define REG_PWR_MGMT_1 0x6B
-#define REG_ACCEL_CFG  0x1C
-#define REG_GYRO_CFG   0x1B
-#define REG_ACCEL_XOUT 0x3B   // 6 bytes: AX_H, AX_L, AY_H, AY_L, AZ_H, AZ_L
-#define REG_GYRO_XOUT  0x43   // 6 bytes: GX_H, GX_L, GY_H, GY_L, GZ_H, GZ_L
-
-// Sensitivity at default ±2g / ±250 deg/s
-#define ACCEL_SCALE  16384.0f
-#define GYRO_SCALE   131.0f
-
-/* ════════════════════════════════════════════
  *  TUNING CONSTANTS
  * ════════════════════════════════════════════ */
 #define SEND_INTERVAL_MS    50     // 20 Hz sensor updates to game
-#define CALIB_SAMPLES       200    // gyro calibration at startup
-#define COMP_ALPHA          0.96f  // complementary filter weight (gyro trust)
-#define PITCH_MAX_DEG       45.0f  // tilt range mapped to ±1
-#define ROLL_MAX_DEG        45.0f
-#define YAW_RATE_MAX_DPS    90.0f  // gyro-Z rate mapped to ±1
 #define JOY_DEADZONE        80     // ADC units from center
-#define BTN_DEBOUNCE_MS     50
+#define CLOUD_STALE_MS      1500
+#define LDR_STALE_MS        1000
 
 /* ════════════════════════════════════════════
  *  GLOBAL STATE
@@ -89,137 +86,24 @@ const char* WS_PATH    = "/";
 WebSocketsClient webSocket;
 bool wsConnected = false;
 
-// MPU-6050 calibration
-float gxOffset = 0.0f, gyOffset = 0.0f, gzOffset = 0.0f;
-
-// Complementary filter state
-float filtPitch = 0.0f, filtRoll = 0.0f;
-unsigned long lastMPUMicros = 0;
-
 // Joystick calibration (read at startup)
 int joyXCenter = 2048, joyYCenter = 2048;
 
-// Button (interrupt-driven)
-volatile bool btnFlag = false;
-unsigned long lastBtnTime = 0;
+// Count accepted falling edges atomically; never clear a press before sending.
+ButtonEvents button;
+portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t fireSession = 0, lastSentFireCount = 0;
 
-// Potentiometer from MCX via UART
-float potValue = -1.0f;   // -1 = not yet received
-
-// UART receive buffer
-char uartBuf[64];
+McxLink mcx;
+char uartBuf[McxLink::MAX_LINE + 1];
 uint8_t uartPos = 0;
-
-// Sensor send timing
+bool uartDiscard = false;
+bool hasCloudState = false;
+uint32_t cloudStateAt = 0;
 unsigned long lastSendTime = 0;
+TiltStatus lastTiltStatus = TiltStatus::NotStarted;
 
-/* ════════════════════════════════════════════
- *  MPU-6050 I2C HELPERS
- * ════════════════════════════════════════════ */
-static void mpuWrite(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-static void mpuRead(uint8_t reg, uint8_t *buf, uint8_t len) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom((uint8_t)MPU_ADDR, len);
-  for (uint8_t i = 0; i < len && Wire.available(); i++) {
-    buf[i] = Wire.read();
-  }
-}
-
-static int16_t combine(uint8_t h, uint8_t l) {
-  return (int16_t)((h << 8) | l);
-}
-
-/* ════════════════════════════════════════════
- *  MPU-6050 INIT & CALIBRATION
- * ════════════════════════════════════════════ */
-static void initMPU() {
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);  // 400 kHz fast-mode
-  delay(100);
-
-  // Wake up (clear sleep bit)
-  mpuWrite(REG_PWR_MGMT_1, 0x00);
-  delay(100);
-
-  // ±2g accel, ±250 deg/s gyro (defaults, explicit for clarity)
-  mpuWrite(REG_ACCEL_CFG, 0x00);
-  mpuWrite(REG_GYRO_CFG,  0x00);
-  delay(50);
-
-  Serial.println("[MPU] Calibrating gyroscope — keep the board still…");
-  float gxSum = 0, gySum = 0, gzSum = 0;
-  for (int i = 0; i < CALIB_SAMPLES; i++) {
-    uint8_t buf[6];
-    mpuRead(REG_GYRO_XOUT, buf, 6);
-    gxSum += combine(buf[0], buf[1]) / GYRO_SCALE;
-    gySum += combine(buf[2], buf[3]) / GYRO_SCALE;
-    gzSum += combine(buf[4], buf[5]) / GYRO_SCALE;
-    delay(5);
-  }
-  gxOffset = gxSum / CALIB_SAMPLES;
-  gyOffset = gySum / CALIB_SAMPLES;
-  gzOffset = gzSum / CALIB_SAMPLES;
-  Serial.printf("[MPU] Gyro offsets: %.2f, %.2f, %.2f deg/s\n", gxOffset, gyOffset, gzOffset);
-}
-
-/* ════════════════════════════════════════════
- *  READ MPU-6050 & COMPLEMENTARY FILTER
- * ════════════════════════════════════════════ */
-struct SensorData {
-  float pitch;   // -1..1
-  float roll;    // -1..1
-  float yaw;     // -1..1 (rate, not angle)
-};
-
-static SensorData readMPU() {
-  SensorData out = {0, 0, 0};
-
-  // Read accel + gyro (14 bytes: accel[6] + temp[2] + gyro[6])
-  uint8_t buf[14];
-  mpuRead(REG_ACCEL_XOUT, buf, 14);
-
-  float ax = combine(buf[0],  buf[1])  / ACCEL_SCALE;
-  float ay = combine(buf[2],  buf[3])  / ACCEL_SCALE;
-  float az = combine(buf[4],  buf[5])  / ACCEL_SCALE;
-  // buf[6..7] = temperature (skip)
-  float gx = combine(buf[8],  buf[9])  / GYRO_SCALE - gxOffset;
-  float gy = combine(buf[10], buf[11]) / GYRO_SCALE - gyOffset;
-  float gz = combine(buf[12], buf[13]) / GYRO_SCALE - gzOffset;
-
-  // Time delta
-  unsigned long now = micros();
-  float dt = (now - lastMPUMicros) / 1000000.0f;
-  if (dt <= 0 || dt > 0.5f) dt = 0.02f;   // sanity clamp
-  lastMPUMicros = now;
-
-  // Accelerometer angles (degrees)
-  float accPitch = atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / M_PI;
-  float accRoll  = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / M_PI;
-
-  // Complementary filter: trust gyro short-term, accel long-term
-  filtPitch = COMP_ALPHA * (filtPitch + gx * dt) + (1.0f - COMP_ALPHA) * accPitch;
-  filtRoll  = COMP_ALPHA * (filtRoll  + gy * dt) + (1.0f - COMP_ALPHA) * accRoll;
-
-  // Map to -1..1 for game
-  out.pitch = constrain(filtPitch / PITCH_MAX_DEG, -1.0f, 1.0f);
-  out.roll  = constrain(filtRoll  / ROLL_MAX_DEG,  -1.0f, 1.0f);
-  // Yaw: use gyro Z rate directly (rotate controller to yaw)
-  out.yaw   = constrain(gz / YAW_RATE_MAX_DPS, -1.0f, 1.0f);
-
-  return out;
-}
-
-/* ════════════════════════════════════════════
- *  JOYSTICK
- * ════════════════════════════════════════════ */
+// Joystick camera controls retain their original axes, signs and deadzone.
 static void calibrateJoystick() {
   long sumX = 0, sumY = 0;
   for (int i = 0; i < 30; i++) {
@@ -249,57 +133,48 @@ static void readJoystick(float &jx, float &jy) {
  *  BUTTON (interrupt)
  * ════════════════════════════════════════════ */
 void IRAM_ATTR buttonISR() {
-  btnFlag = true;
+  portENTER_CRITICAL_ISR(&buttonMux);
+  button.edge(millis());
+  portEXIT_CRITICAL_ISR(&buttonMux);
 }
 
-static bool readButton() {
-  if (btnFlag) {
-    unsigned long now = millis();
-    if (now - lastBtnTime >= BTN_DEBOUNCE_MS) {
-      lastBtnTime = now;
-      btnFlag = false;
-      return true;
-    }
-    btnFlag = false;
-  }
-  return false;
+static uint32_t buttonCount() {
+  portENTER_CRITICAL(&buttonMux);
+  const uint32_t count = button.count();
+  portEXIT_CRITICAL(&buttonMux);
+  return count;
 }
 
 /* ════════════════════════════════════════════
  *  UART TO/FROM MCXC444
  * ════════════════════════════════════════════ */
 
-// Parse incoming: SENSOR:POT,<value>
-static void processUARTLine(const char *line) {
-  // Expected: "SENSOR:POT,<0..4095>"
-  if (strncmp(line, "SENSOR:POT,", 11) == 0) {
-    int raw = atoi(line + 11);
-    potValue = constrain((float)raw / 4095.0f, 0.0f, 1.0f);
-  }
-}
-
 static void readUART() {
   while (Serial1.available()) {
-    char c = (char)Serial1.read();
+    const char c = static_cast<char>(Serial1.read());
     if (c == '\n') {
-      if (uartPos > 0) {
+      if (!uartDiscard && uartPos) {
         uartBuf[uartPos] = '\0';
-        processUARTLine(uartBuf);
-        uartPos = 0;
+        mcx.receive(uartBuf, millis());
       }
-    } else if (c != '\r') {
-      if (uartPos < sizeof(uartBuf) - 1) {
-        uartBuf[uartPos++] = c;
-      } else {
-        uartPos = 0;   // overflow → discard
-      }
+      uartPos = 0;
+      uartDiscard = false;
+    } else if (c != '\r' && !uartDiscard) {
+      if (uartPos < sizeof(uartBuf) - 1) uartBuf[uartPos++] = c;
+      else uartDiscard = true;  // Discard the entire oversized line.
     }
   }
 }
 
-// Forward game events to MCX: GAME:<event>,<value>\n
-static void forwardToMCX(const char *event, int value) {
-  Serial1.printf("GAME:%s,%d\n", event, value);
+static void serviceMCX(uint32_t now) {
+  if (!wsConnected || !hasCloudState || uint32_t(now - cloudStateAt) > CLOUD_STALE_MS) {
+    mcx.suspend();  // Let the MCX watchdog expose a lost cloud/browser link.
+    return;
+  }
+  if (Serial1.availableForWrite() >= static_cast<int>(McxLink::MAX_LINE + 1)) {
+    const char *frame = mcx.nextFrame(now);
+    if (frame) Serial1.print(frame);
+  }
 }
 
 /* ════════════════════════════════════════════
@@ -316,33 +191,30 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
     case WStype_DISCONNECTED:
       wsConnected = false;
+      hasCloudState = false;
+      mcx.suspend();
       Serial.println("[WS] Disconnected");
       break;
 
     case WStype_TEXT: {
-      // Parse game events: {"type":"event","event":"HIT","value":1}
-      // Simple string-based parser (no ArduinoJson dependency)
-      char *s = (char *)payload;
-
-      // Find "event":"<name>"
-      char *evPtr = strstr(s, "\"event\":\"");
-      if (!evPtr) break;
-      evPtr += 9;  // skip past "event":"
-      char *evEnd = strchr(evPtr, '"');
-      if (!evEnd) break;
-      *evEnd = '\0';
-      const char *eventName = evPtr;
-
-      // Find "value":
-      char *valPtr = strstr(evEnd + 1, "\"value\":");
-      int value = 0;
-      if (valPtr) {
-        valPtr += 8;
-        value = atoi(valPtr);
+      // Length-aware parsing: WebSocket payloads need not be null terminated.
+      if (length > 512) break;
+      JsonDocument doc;
+      if (deserializeJson(doc, payload, length)) break;
+      const char *kind = doc["type"] | "";
+      if (!strcmp(kind, "game_state")) {
+        if (!doc["lives"].is<unsigned>() || !doc["score"].is<unsigned long>() ||
+            !doc["mode"].is<const char *>()) break;
+        if (mcx.setState(doc["lives"].as<unsigned>(), doc["score"].as<unsigned long>(),
+                         doc["mode"].as<const char *>())) {
+          cloudStateAt = millis();
+          hasCloudState = true;
+        }
+      } else if (!strcmp(kind, "event") && hasCloudState &&
+                 uint32_t(millis() - cloudStateAt) <= CLOUD_STALE_MS) {
+        const char *event = doc["event"] | "";
+        if (!mcx.queueEvent(event)) Serial.printf("[MCX] Rejected/dropped event: %s\n", event);
       }
-
-      Serial.printf("[WS] Event: %s = %d\n", eventName, value);
-      forwardToMCX(eventName, value);
       break;
     }
 
@@ -354,39 +226,40 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 /* ════════════════════════════════════════════
  *  BUILD & SEND SENSOR JSON
  * ════════════════════════════════════════════ */
-static void sendSensorData(SensorData &mpu, float jx, float jy, bool fire) {
-  if (!wsConnected) return;
+static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint32_t presses) {
+  if (!wsConnected) return false;
+  const bool ldrValid = mcx.hasLdr && uint32_t(millis() - mcx.ldrAt) <= LDR_STALE_MS;
+  char json[384];
+  const int len = snprintf(json, sizeof(json),
+    "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
+    "\"tiltValid\":%s,\"joyX\":%.3f,\"joyY\":%.3f,\"fire\":%s,"
+    "\"fireSession\":%lu,\"fireCount\":%lu,\"firePending\":%lu,"
+    "\"ldrValid\":%s,\"ldrRaw\":%u,\"dark\":%s}",
+    reading.pitch, reading.roll, reading.yaw, reading.valid ? "true" : "false", jx, jy,
+    presses != lastSentFireCount ? "true" : "false",
+    static_cast<unsigned long>(fireSession), static_cast<unsigned long>(presses),
+    static_cast<unsigned long>(uint32_t(presses - lastSentFireCount)),
+    ldrValid ? "true" : "false", mcx.ldrRaw, ldrValid && mcx.ldrDark ? "true" : "false");
+  return len > 0 && len < static_cast<int>(sizeof(json)) && webSocket.sendTXT(json, len);
+}
 
-  // Build JSON with sprintf (avoids ArduinoJson dependency)
-  char json[256];
-  int len;
-
-  if (potValue >= 0) {
-    len = snprintf(json, sizeof(json),
-      "{\"type\":\"sensor\","
-      "\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
-      "\"joyX\":%.3f,\"joyY\":%.3f,"
-      "\"fire\":%s,"
-      "\"pot\":%.3f}",
-      mpu.pitch, mpu.roll, mpu.yaw,
-      jx, jy,
-      fire ? "true" : "false",
-      potValue
-    );
-  } else {
-    len = snprintf(json, sizeof(json),
-      "{\"type\":\"sensor\","
-      "\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
-      "\"joyX\":%.3f,\"joyY\":%.3f,"
-      "\"fire\":%s}",
-      mpu.pitch, mpu.roll, mpu.yaw,
-      jx, jy,
-      fire ? "true" : "false"
-    );
+// Recovery is explicit to avoid repeatedly blocking the loop on broken I2C.
+// Serial: c = recalibrate, r = recenter, i = reinitialize a reconnected MPU.
+static void serviceTilt() {
+  tilt.update();
+  if (Serial.available()) {
+    switch (Serial.read()) {
+      case 'c': tilt.startCalibration(); break;
+      case 'r': tilt.recenter(); break;
+      case 'i': tilt.begin(Wire, 0x68); break;
+    }
   }
-
-  if (len > 0 && len < (int)sizeof(json)) {
-    webSocket.sendTXT(json);
+  const TiltStatus status = tilt.status();
+  if (status != lastTiltStatus) {
+    const char *names[] = {"not started", "calibrating: hold still, component side up",
+                           "ready", "fault: check wiring, then send i", "stale"};
+    Serial.printf("[TILT] %s\n", names[static_cast<unsigned>(status)]);
+    lastTiltStatus = status;
   }
 }
 
@@ -410,10 +283,6 @@ void setup() {
   pinMode(BTN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN_PIN), buttonISR, FALLING);
   Serial.printf("[BTN] GPIO%d, interrupt on FALLING\n", BTN_PIN);
-
-  // MPU-6050
-  initMPU();
-  lastMPUMicros = micros();
 
   // Joystick calibration (read center position at rest)
   calibrateJoystick();
@@ -441,6 +310,14 @@ void setup() {
   webSocket.setReconnectInterval(5000);
   Serial.printf("[WS] Target: wss://%s%s\n", WS_HOST, WS_PATH);
 
+  // Begin after blocking startup work; loop() collects calibration samples.
+  fireSession = esp_random();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+  Wire.setTimeOut(20);
+  tilt.begin(Wire, 0x68);
+  Serial.println("[TILT] Keep still near level for about 2.25 seconds");
+  Serial.println("[TILT] Serial commands: c=calibrate, r=recenter, i=reinitialize");
   Serial.println("\n[READY] Entering main loop\n");
 }
 
@@ -448,25 +325,18 @@ void setup() {
  *  MAIN LOOP
  * ════════════════════════════════════════════ */
 void loop() {
-  // Service WebSocket (must call frequently)
+  serviceTilt();  // Poll frequently; TiltController schedules samples at 100 Hz.
   webSocket.loop();
-
-  // Read UART from MCX (pot sensor data)
   readUART();
+  const uint32_t now = millis();
+  serviceMCX(now);
 
-  // Read all sensors
-  SensorData mpu = readMPU();
-  float jx, jy;
-  readJoystick(jx, jy);
-  bool fire = readButton();
-
-  // Send sensor data to game at fixed interval
-  unsigned long now = millis();
-  if (now - lastSendTime >= SEND_INTERVAL_MS) {
+  if (uint32_t(now - lastSendTime) >= SEND_INTERVAL_MS) {
     lastSendTime = now;
-    sendSensorData(mpu, jx, jy, fire);
+    float jx, jy;
+    readJoystick(jx, jy);
+    const uint32_t presses = buttonCount();
+    if (sendSensorData(tilt.latest(), jx, jy, presses)) lastSentFireCount = presses;
   }
-
-  // Small yield to avoid WDT
   delay(1);
 }

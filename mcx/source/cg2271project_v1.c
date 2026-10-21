@@ -380,6 +380,7 @@ static void commRxTask(void *p)
     int32_t seq;
     TxFrame reply;
     bool linkUp = false;
+    proto_history_t history = { 0 };
 
     /* Enable UART only once the scheduler and queues are running. */
     initUART2(BAUD_RATE);
@@ -407,8 +408,13 @@ static void commRxTask(void *p)
 
         if (!linkUp) {
             linkUp = true;
+            setLinkUp(true);
             LOG("LINK: up\r\n");
         }
+
+        /* A lost ACK causes an identical stop-and-wait retry. ACK it again,
+         * but keep HIT/BONUS sounds and START/OVER effects one-shot. */
+        if (!proto_remember(&history, line.message)) continue;
 
         if (msg.type == MSG_GAME_STATE) {
             game_mode_t oldMode = MODE_IDLE;

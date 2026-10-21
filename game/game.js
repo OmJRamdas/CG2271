@@ -16,6 +16,15 @@ const player = { mesh: null };
 function initPlayer() {
   if (player.mesh) scene.remove(player.mesh);
   player.mesh = makeplane(0x2266cc, 0xffffff);
+  player.mesh.userData.navigationLights = [-1, 1].map(side => {
+    const color = side < 0 ? 0xff3333 : 0x33ff66;
+    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 4),
+      new THREE.MeshBasicMaterial({ color }));
+    lamp.position.set(side * 3.7, 0.12, 0.15);
+    lamp.userData.normalColor = color;
+    player.mesh.add(lamp);
+    return lamp;
+  });
   player.mesh.position.set(0, C.START_ALT, 0);
   scene.add(player.mesh);
 }
@@ -125,45 +134,126 @@ function readKeyboard() {
   else S.camY = mouseY;
 }
 
+/* ===== Controller input ===== */
+const CONTROLLER_STALE_MS = 300;
+const controller = {
+  at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
+  pendingFire: 0, fireSession: null, fireCount: 0,
+  ldrValid: false, dark: false, ldrRaw: 0,
+};
+
+function clearController() {
+  controller.at = -Infinity;
+  controller.pendingFire = 0;
+  controller.ldrValid = false;
+  controller.dark = false;
+  S.stealth = false;
+  // Keep the last session/count so reconnects do not replay delivered presses.
+}
+
+function receiveSensor(d) {
+  const axes = ['pitch', 'roll', 'yaw', 'joyX', 'joyY'];
+  if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
+  controller.at = performance.now();
+  for (const key of axes) controller[key] = clamp(d[key], -1, 1);
+  if (d.tiltValid === false) controller.pitch = controller.roll = controller.yaw = 0;
+  controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
+    d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
+  controller.dark = controller.ldrValid && d.dark;
+  controller.ldrRaw = controller.ldrValid ? d.ldrRaw : 0;
+
+  const uint32 = n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
+  let presses = 0;
+  if (uint32(d.fireSession) && uint32(d.fireCount)) {
+    if (controller.fireSession !== d.fireSession) {
+      controller.fireSession = d.fireSession;
+      controller.pendingFire = 0;
+      // A first packet only owns presses still pending at the ESP32, not its
+      // entire boot history. Subsequent counters recover missed sensor packets.
+      presses = uint32(d.firePending) ? d.firePending : (d.fire === true ? 1 : 0);
+      controller.fireCount = d.fireCount;
+    } else {
+      const delta = (d.fireCount - controller.fireCount) >>> 0;
+      if (delta < 0x80000000) {
+        presses = delta;
+        controller.fireCount = d.fireCount;
+      }
+    }
+  } else if (d.fire === true) presses = 1;  // Legacy boolean sender.
+  if (S.running) controller.pendingFire += presses;
+}
+
+function readInputs() {
+  readKeyboard();  // Original keyboard directions and held-space firing.
+  if (!ws || ws.readyState !== 1 || performance.now() - controller.at > CONTROLLER_STALE_MS) {
+    clearController();
+    return;
+  }
+  S.pIn = controller.pitch;
+  S.rIn = controller.roll;
+  S.yIn = controller.yaw;
+  S.camX = controller.joyX;
+  S.camY = controller.joyY;
+  S.stealth = controller.ldrValid && controller.dark;
+  // Leave throttle on Shift/Ctrl; the MCX now has an LDR, not a potentiometer.
+  S.fire = S.fire || controller.pendingFire > 0;
+}
+
 /* ===== WebSocket ===== */
 function toggleWS() {
   if (ws && ws.readyState <= 1) { ws.close(); return; }
   const url = document.getElementById('ws-url').value.trim();
   if (!url) return;
   try {
-    ws = new WebSocket(url);
-    ws.onopen = () => {
+    const socket = new WebSocket(url);
+    ws = socket;
+    clearController();
+    socket.onopen = () => {
+      if (ws !== socket) return;
       document.getElementById('ws-dot').classList.add('on');
       document.getElementById('ws-btn').textContent = 'Disconnect';
-      ws.send(JSON.stringify({ type: 'identify', role: 'game' }));
+      socket.send(JSON.stringify({ type: 'identify', role: 'game' }));
+      sendGameState();
     };
-    ws.onclose = () => {
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      clearController();
       document.getElementById('ws-dot').classList.remove('on');
       document.getElementById('ws-btn').textContent = 'Connect';
     };
-    ws.onerror = () => ws.close();
-    ws.onmessage = (ev) => {
+    socket.onerror = () => socket.close();
+    socket.onmessage = (ev) => {
+      if (ws !== socket) return;
       try {
         const d = JSON.parse(ev.data);
-        if (d.type === 'sensor') {
-          if (d.pitch !== undefined) S.pIn = clamp(d.pitch, -1, 1);
-          if (d.roll  !== undefined) S.rIn = clamp(d.roll, -1, 1);
-          if (d.yaw   !== undefined) S.yIn = clamp(d.yaw, -1, 1);
-          if (d.joyX  !== undefined) S.camX = clamp(d.joyX, -1, 1);
-          if (d.joyY  !== undefined) S.camY = clamp(d.joyY, -1, 1);
-          if (d.fire) S.fire = true;
-          if (d.pot   !== undefined) S.potThrottle = clamp(d.pot, 0, 1);
-        }
+        if (d && d.type === 'sensor') receiveSensor(d);
       } catch (_) {}
     };
   } catch (_) {}
 }
 
-function sendEvent(event, value) {
+function sendGameState() {
   if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({
+      type: 'game_state',
+      // Preserve the game's 100-point hull; expose three gauge segments to MCX.
+      lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
+      score: Math.floor(clamp(S.score, 0, 9999999)),
+      mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
+    }));
+  }
+}
+
+function sendEvent(event, value) {
+  if (!['HIT', 'START', 'OVER', 'BONUS'].includes(event)) return;
+  if (ws && ws.readyState === 1) {
+    sendGameState();
     ws.send(JSON.stringify({ type: 'event', event, value }));
   }
 }
+
+// Runs on the start screen and after game over too, independently of rendering.
+setInterval(sendGameState, 400);
 
 /* ===== Player physics ===== */
 function updatePlayer() {
@@ -171,12 +261,7 @@ function updatePlayer() {
   S.cR = lerp(S.cR, S.rIn, C.CTRL_LERP);
   S.cY = lerp(S.cY, S.yIn, C.CTRL_LERP);
 
-  // Throttle: pot overrides keyboard
-  if (S.potThrottle >= 0) {
-    S.targetSpeed = C.MIN_SPD + S.potThrottle * (C.MAX_SPD - C.MIN_SPD);
-  } else {
-    S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
-  }
+  S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
   S.speed = lerp(S.speed, S.targetSpeed, 0.03);
 
   _qP.setFromAxisAngle(_axisX, S.cP * C.PITCH_SPD);
@@ -210,6 +295,7 @@ function updatePlayer() {
     const p = player.mesh.position.clone().addScaledVector(_fwd, 3.5);
     projectiles.push(new Projectile(p, _fwd.clone()));
     S.fireCD = C.FIRE_CD;
+    if (controller.pendingFire > 0) controller.pendingFire--;
   }
 }
 
@@ -296,8 +382,7 @@ function spawnWave(waveNum) {
   banner.style.opacity = '1';
   setTimeout(() => { banner.style.opacity = '0'; }, 2000);
 
-  sendEvent('BOOST', 1);
-  setTimeout(() => sendEvent('BOOST', 0), 500);
+  if (waveNum > 1) sendEvent('BONUS', waveNum);
 }
 
 function checkWaveComplete() {
@@ -306,6 +391,7 @@ function checkWaveComplete() {
     S.waveTransition = true;
     S.waveDelay = C.WAVE_DELAY;
     S.health = Math.min(100, S.health + 25);
+    sendGameState();
     addKillMsg('WAVE ' + S.wave + ' CLEARED!');
   }
 }
@@ -345,10 +431,13 @@ function updateHUD() {
   document.getElementById('speed-box').textContent = 'SPD: ' + (S.speed * 100).toFixed(0);
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
 
-  if (ws && ws.readyState === 1) {
-    const euler = new THREE.Euler().setFromQuaternion(player.mesh.quaternion, 'YXZ');
-    sendEvent('ROLL', Math.round(THREE.MathUtils.radToDeg(euler.z)));
-  }
+  const stealth = S.stealth ? ' · STEALTH' : '';
+  document.getElementById('controls-help').textContent =
+    'WASD Pitch/Roll  Q/E Yaw  Arrows Camera  Shift/Ctrl Throttle  Space Fire' + stealth;
+  // Covering the LDR dims the aircraft's lights, without changing steering.
+  player.mesh.userData.navigationLights.forEach(lamp => {
+    lamp.material.color.setHex(lamp.userData.normalColor).multiplyScalar(S.stealth ? 0.15 : 1);
+  });
 }
 
 /* ===== Game over / restart ===== */
@@ -358,7 +447,8 @@ function gameOver() {
   document.getElementById('final-score').textContent = S.score;
   document.getElementById('final-wave').textContent = S.wave;
   document.getElementById('game-over').style.display = 'flex';
-  sendEvent('SCORE', S.score);
+  controller.pendingFire = 0;
+  sendEvent('OVER', S.score);
 }
 
 function restartGame() {
@@ -367,7 +457,8 @@ function restartGame() {
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;
   S.fireCD = 0; S.dmgCD = 0; S.over = false; S.running = true;
-  S.fire = false; S.potThrottle = -1;
+  S.fire = false; S.stealth = false;
+  controller.pendingFire = 0;
   S.camX = 0; S.camY = 0; S.sCamX = 0; S.sCamY = 0;
   S.wave = 1; S.waveEnemiesAlive = 0; S.waveTransition = false; S.waveDelay = 0;
 
@@ -377,6 +468,7 @@ function restartGame() {
   enemies.forEach(e => e.remove());          enemies.length = 0;
 
   initPlayer();
+  sendEvent('START', 1);
   spawnWave(1);
   document.getElementById('game-over').style.display = 'none';
   document.getElementById('hud').style.display = 'block';
@@ -388,7 +480,7 @@ function loop() {
   if (!S.running) return;
   requestAnimationFrame(loop);
 
-  readKeyboard();
+  readInputs();
   updatePlayer();
   S.dmgCD = Math.max(0, S.dmgCD - 1);
 
@@ -418,6 +510,7 @@ document.getElementById('start-screen').addEventListener('click', () => {
   document.getElementById('hud').style.display = 'block';
   renderer.domElement.focus();
   S.running = true;
+  sendEvent('START', 1);
   spawnWave(1);
   loop();
 });

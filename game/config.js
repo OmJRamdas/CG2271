@@ -46,7 +46,7 @@ const C = {
 const S = {
   score: 0, kills: 0, health: 100, speed: 1.2, targetSpeed: 1.2,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
-  potThrottle: -1,          // -1 = pot not connected; 0..1 from MCX
+  stealth: false,          // Fresh MCX LDR reports darkness
   camX: 0, camY: 0,        // raw joystick / mouse camera input
   sCamX: 0, sCamY: 0,      // smoothed camera orbit
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
