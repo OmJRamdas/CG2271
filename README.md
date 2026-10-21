@@ -42,7 +42,7 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
  │    commTxTask (pri 2) — sole owner of UART TX          │
  │    ldrTask    (pri 2) — LDR ADC polling, report        │
  │    ledTask    (pri 1) — red LED patterns               │
- │    buzzerTask (pri 1) — buzzer tunes (TPM1 PWM)        │
+ │    buzzerTask (pri 1) — buzzer beep patterns (GPIO)    │
  │    servoTask  (pri 1) — lives gauge (TPM0 PWM)         │
  │                                                        │
  │  Sync:                                                 │
@@ -52,11 +52,11 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
  │                                                        │
  │  Actuators:                                            │
  │    - Red LED    PTE31  (onboard, active-LOW)           │
- │    - Buzzer     PTA12  D3 (external, passive, PWM)     │
+ │    - Buzzer     PTD4   D10 (external, active, GPIO)    │
  │    - Servo SG90 PTA5   D5 (external, PWM)              │
  │                                                        │
  │  Sensor:                                               │
- │    - LDR (photoresistor) PTB2 A2 (ADC0_SE12)           │
+ │    - LDR (photoresistor) PTB0 A0 (ADC0_SE8)            │
  └────────────────────────────────────────────────────────┘
 ```
 
@@ -69,14 +69,14 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | 1 | GY-521 MPU-6050 | ESP32-S2 | I2C (SDA/SCL) | Polled (~30 Hz) | Tilt → pitch & roll of airplane |
 | 2 | Joystick module | ESP32-S2 | 2× ADC + 1 GPIO | Polled (ADC), interrupt (button) | Throttle (Y-axis), yaw (X-axis) |
 | 3 | Push button | ESP32-S2 | GPIO | Interrupt (falling edge) | Fire / boost |
-| 4 | LDR (photoresistor) | MCXC444 | ADC0_SE12, PTB2 (A2) | Polled (ldrTask, 100 ms) | Stealth mode — cover to dim lights |
+| 4 | LDR (photoresistor) | MCXC444 | ADC0_SE8, PTB0 (A0) | Polled (ldrTask, 100 ms) | Stealth mode — cover to dim lights |
 
 ### Actuators (3 required)
 
 | # | Actuator | Connected to | Pin | Type | Purpose |
 |---|----------|--------------|-----|------|---------|
 | 1 | Red LED | MCXC444 | PTE31 (onboard) | GPIO, active-LOW | Game mode / hit / link-lost indicator |
-| 2 | Passive buzzer | MCXC444 | PTA12, header D3 | TPM1_CH0 PWM (tone) | A tune per game event |
+| 2 | Active buzzer | MCXC444 | PTD4, header D10 | GPIO, active-HIGH | A beep pattern per game event |
 | 3 | Servo SG90 | MCXC444 | PTA5, header D5 | TPM0_CH2 PWM, 50 Hz | Lives gauge (0 lives = 0°, 3 = 180°) |
 
 ### MCXC444 wiring
@@ -87,10 +87,10 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | UART2 RX | PTE23 | — | ESP32 Serial1 TX |
 | GND | GND | — | ESP32 GND (common ground is required) |
 | Servo signal | PTA5 | D5 | SG90 orange wire (power the servo from 5 V, GND shared) |
-| Buzzer signal | PTA12 | D3 | buzzer S pin (VCC → 3.3 V, GND → GND) |
-| LDR | PTB2 | A2 | 3.3 V — LDR — A2 — 10 kΩ — GND |
+| Buzzer signal | PTD4 | D10 | buzzer S pin (VCC → 3.3 V, GND → GND) |
+| LDR | PTB0 | A0 | 3.3 V — LDR — A0 — 10 kΩ — GND |
 
-The pins were chosen from the MCXC444 reference manual's pin-mux table and the FRDM schematic (`mcx/extras/`). PTD0/PTD4/PTE20/PTE21 are shared with the onboard LCD, and PTB0/PTB1 go to the MCU-Link I2C bus, so all of those are avoided.
+The pins were chosen from the MCXC444 reference manual's pin-mux table and the FRDM schematic (`mcx/extras/`). The servo is on PTA5 because PTD0 (the old servo pin) isn't on any header; it's wired to the onboard LCD. PTB0 also carries the MCU-Link I2C clock. If the LDR readings are noisy, move it to PTB2 (header A2) by setting `LDR_PIN 2U` and `LDR_ADC_CH 12U`.
 
 ## UART Protocol (Bi-directional, 9600 baud 8N1)
 
@@ -131,9 +131,9 @@ $<TYPE>,<seq>,<fields...>*<CK>\n
 | mode `IDLE` | short blip every 2 s | — | follows lives |
 | mode `PLAY` | solid on | — | follows lives |
 | mode `OVER` | 5 Hz blink | — | 0° |
-| `EV HIT` | triple flash | falling two-note tune | — |
-| `EV BONUS` | double flash | rising two-note tune | — |
-| `EV START` / `EV OVER` | mode changes immediately | start / game-over tune | — |
+| `EV HIT` | triple flash | two short beeps | — |
+| `EV BONUS` | double flash | two quick chirps | — |
+| `EV START` / `EV OVER` | mode changes immediately | three rising beeps / one long beep | — |
 | link lost (2 s silence) | 1 Hz blink | — | holds position |
 
 ## FreeRTOS Design (MCXC444)
@@ -148,7 +148,7 @@ Code: [mcx/source/cg2271project_v1.c](mcx/source/cg2271project_v1.c). The kernel
 | `commTxTask` | 2 | MINIMAL+80 | The only task that writes to UART2: takes a frame from `txQueue`, starts the interrupt-driven send, then waits on `txDoneSem` |
 | `ldrTask` | 2 | MINIMAL+200 | Every 100 ms: starts an ADC conversion and waits for the ISR's notification. Applies a 4-sample moving average and dark/light hysteresis, then queues `$LDR` |
 | `ledTask` | 1 | MINIMAL+40 | Flash patterns from `ledQueue`; otherwise shows the mode or link state |
-| `buzzerTask` | 1 | MINIMAL+40 | Plays a tune per event from `buzzerQueue`. The tone comes from TPM1 hardware PWM, so pitch doesn't depend on task timing |
+| `buzzerTask` | 1 | MINIMAL+40 | Plays an on/off beep pattern per event from `buzzerQueue` on the active buzzer (GPIO; the buzzer makes its own tone) |
 | `servoTask` | 1 | MINIMAL+40 | Lives gauge with slew limiting, updated every 50 ms |
 
 ### ISRs
@@ -253,7 +253,7 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 ### Stream 3 — MCXC444 FreeRTOS Firmware
 - ✅ UART RX and TX, both interrupt-driven, using the checksummed frame protocol (`$GS`/`$EV` in, `$ACK`/`$NAK`/`$LDR` out).
 - ✅ LDR polling task with an interrupt-driven ADC, smoothing and hysteresis.
-- ✅ LED, buzzer (TPM1 tone) and servo (TPM0 lives gauge) tasks.
+- ✅ LED, buzzer (GPIO beep patterns) and servo (TPM0 lives gauge) tasks.
 - ✅ gameStateMutex, printMutex, txDoneSem, 4 queues; time-slicing and pre-emption on; unused kernel features off.
 - ✅ Host unit tests (`mcx/tests`) and the ESP32 simulator (`mcx/tools/esp32_sim.py`).
 - ⏳ On-hardware verification with the simulator, then integration with the ESP32.

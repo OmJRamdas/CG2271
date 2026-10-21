@@ -9,9 +9,11 @@
  *   UART2 RX   PTE23  ALT4        <- ESP32 TX
  *   Red LED    PTE31  GPIO        onboard, active-LOW
  *   Servo      PTA5   ALT3        TPM0_CH2, 50 Hz          (header D5)
- *   Buzzer     PTA12  ALT3        TPM1_CH0, passive, tone  (header D3)
- *   LDR        PTB2   ALT0        ADC0_SE12                (header A2)
- *              wiring: 3V3 - LDR - A2 - 10k - GND  (bright = high reading)
+ *   Buzzer     PTD4   GPIO        active, active-HIGH      (header D10)
+ *   LDR        PTB0   ALT0        ADC0_SE8                 (header A0)
+ *              wiring: 3V3 - LDR - A0 - 10k - GND  (bright = high reading)
+ *              PTB0 also carries the MCU-Link I2C SCL; if readings are noisy
+ *              move the LDR to PTB2 / A2 (LDR_PIN 2U, LDR_ADC_CH 12U).
  *
  * Protocol: see protocol.h ($GS / $EV in, $ACK / $NAK / $LDR out).
  *
@@ -25,7 +27,7 @@
  *     commTxTask   pri 2   sole owner of UART TX (txQueue -> ISR)
  *     ldrTask      pri 2   polled LDR every 100 ms, report to ESP32
  *     ledTask      pri 1   LED patterns           } time-sliced with
- *     buzzerTask   pri 1   tone sequences         } each other
+ *     buzzerTask   pri 1   beep patterns          } each other
  *     servoTask    pri 1   lives gauge            }
  *   Sync:
  *     Queues   rxQueue, txQueue, ledQueue, buzzerQueue
@@ -63,18 +65,16 @@
 #define RED_PIN              31U    /* PTE31 onboard active-LOW red LED  */
 #define SERVO_PIN             5U    /* PTA5  TPM0_CH2                    */
 #define SERVO_CH              2U
-#define BUZZER_PIN           12U    /* PTA12 TPM1_CH0                    */
-#define BUZZER_CH             0U
-#define LDR_PIN               2U    /* PTB2  ADC0_SE12                   */
-#define LDR_ADC_CH           12U
+#define BUZZER_PIN            4U    /* PTD4  GPIO, active buzzer         */
+#define BUZZER_ACTIVE_LOW     0     /* set to 1 if LOW makes it beep     */
+#define LDR_PIN               0U    /* PTB0  ADC0_SE8                    */
+#define LDR_ADC_CH            8U
 
-/* TPM clock: IRC48M (TPMSRC = 1).
- * Servo  TPM0: 48 MHz / 128 = 375 kHz, MOD 7499 -> 50 Hz, 1 count = 2.67 us.
- * Buzzer TPM1: 48 MHz / 16  = 3 MHz,   MOD = 3 MHz / f - 1.               */
+/* Servo TPM0 clock: IRC48M (TPMSRC = 1) / 128 = 375 kHz,
+ * MOD 7499 -> 50 Hz, 1 count = 2.67 us. */
 #define SERVO_MOD          7499U
 #define SERVO_MIN_CNV       225U    /* 0.6 ms -> 0 deg   (tune if servo buzzes) */
 #define SERVO_MAX_CNV       900U    /* 2.4 ms -> 180 deg                       */
-#define BUZZER_TPM_HZ   3000000UL
 
 /* ===================================================================
  * Application tuning
@@ -114,7 +114,7 @@ typedef struct {
     bool        linkUp;
 } GameState;
 
-typedef struct { uint16_t freq; uint16_t ms; } Note;   /* freq 0 = rest */
+typedef struct { bool on; uint16_t ms; } Beep;          /* ms 0 = end */
 
 /* ===================================================================
  * FreeRTOS objects & shared data
@@ -167,34 +167,46 @@ static inline void setRedLED(bool on)
 }
 
 /* ===================================================================
- * Low-level: TPM0 servo + TPM1 buzzer (edge-aligned PWM)
+ * Low-level: Buzzer (active buzzer, GPIO on/off)
  * =================================================================*/
-static void initPWM(void)
+static void initBuzzer(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTD_MASK;
+#if BUZZER_ACTIVE_LOW
+    GPIOD->PSOR  = 1UL << BUZZER_PIN;            /* start HIGH (off)  */
+#else
+    GPIOD->PCOR  = 1UL << BUZZER_PIN;            /* start LOW (off)   */
+#endif
+    GPIOD->PDDR |= 1UL << BUZZER_PIN;            /* output            */
+    PORTD->PCR[BUZZER_PIN] = PORT_PCR_MUX(1U);   /* GPIO              */
+}
+
+static inline void setBuzzer(bool on)
+{
+    if (on != (bool)BUZZER_ACTIVE_LOW) GPIOD->PSOR = 1UL << BUZZER_PIN;
+    else                               GPIOD->PCOR = 1UL << BUZZER_PIN;
+}
+
+/* ===================================================================
+ * Low-level: Servo (TPM0 channel 2, edge-aligned PWM, 50 Hz)
+ * =================================================================*/
+static void initServo(void)
 {
     SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK;
-    SIM->SCGC6 |= SIM_SCGC6_TPM0_MASK | SIM_SCGC6_TPM1_MASK;
+    SIM->SCGC6 |= SIM_SCGC6_TPM0_MASK;
 
-    PORTA->PCR[SERVO_PIN]  = PORT_PCR_MUX(3U);   /* TPM0_CH2 */
-    PORTA->PCR[BUZZER_PIN] = PORT_PCR_MUX(3U);   /* TPM1_CH0 */
+    PORTA->PCR[SERVO_PIN] = PORT_PCR_MUX(3U);    /* TPM0_CH2 */
 
     SIM->SOPT2 &= ~SIM_SOPT2_TPMSRC_MASK;
     SIM->SOPT2 |=  SIM_SOPT2_TPMSRC(1U);         /* IRC48M */
 
-    /* Servo: 50 Hz, start centred. */
+    /* 50 Hz, start centred. */
     TPM0->SC  = 0;
     TPM0->CNT = 0;
     TPM0->MOD = SERVO_MOD;
     TPM0->CONTROLS[SERVO_CH].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
     TPM0->CONTROLS[SERVO_CH].CnV  = (SERVO_MIN_CNV + SERVO_MAX_CNV) / 2U;
     TPM0->SC  = TPM_SC_CMOD(1U) | TPM_SC_PS(7U);  /* /128 */
-
-    /* Buzzer: silent (0 % duty) until a tone is requested. */
-    TPM1->SC  = 0;
-    TPM1->CNT = 0;
-    TPM1->MOD = (uint32_t)(BUZZER_TPM_HZ / 1000UL) - 1U;
-    TPM1->CONTROLS[BUZZER_CH].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
-    TPM1->CONTROLS[BUZZER_CH].CnV  = 0;
-    TPM1->SC  = TPM_SC_CMOD(1U) | TPM_SC_PS(4U);  /* /16 */
 }
 
 /* 0 .. 180 degrees. */
@@ -202,19 +214,6 @@ static void setServoDeg(uint32_t deg)
 {
     if (deg > 180U) deg = 180U;
     TPM0->CONTROLS[SERVO_CH].CnV = SERVO_MIN_CNV + deg * (SERVO_MAX_CNV - SERVO_MIN_CNV) / 180U;
-}
-
-/* Square wave at freq Hz (50 % duty); freq 0 silences the buzzer. */
-static void setBuzzerTone(uint32_t freq)
-{
-    if (freq == 0U) {
-        TPM1->CONTROLS[BUZZER_CH].CnV = 0;
-        return;
-    }
-    uint32_t mod = BUZZER_TPM_HZ / freq - 1U;
-    TPM1->MOD = mod;
-    TPM1->CNT = 0;                                 /* avoid a long first period */
-    TPM1->CONTROLS[BUZZER_CH].CnV = (mod + 1U) / 2U;
 }
 
 /* ===================================================================
@@ -568,15 +567,15 @@ static void ledTask(void *p)
 
 /* ===================================================================
  * TASK: buzzerTask (priority 1)
- * Plays a short tone sequence per game event on the passive buzzer.
- * The tone itself is hardware PWM (TPM1), so timing jitter does not
- * affect pitch; the task only sequences notes.
+ * Plays an on/off beep pattern per game event on the active buzzer
+ * (the buzzer generates its own tone; the task only times the beeps).
  * =================================================================*/
-static const Note TUNE_HIT[]   = { {392, 80}, {262, 160}, {0, 0} };
-static const Note TUNE_START[] = { {523, 100}, {659, 100}, {784, 160}, {0, 0} };
-static const Note TUNE_OVER[]  = { {784, 200}, {523, 200}, {392, 200}, {262, 400}, {0, 0} };
-static const Note TUNE_BONUS[] = { {784, 80}, {1047, 120}, {0, 0} };
-static const Note *const TUNES[] = { TUNE_HIT, TUNE_START, TUNE_OVER, TUNE_BONUS };
+static const Beep PAT_HIT[]   = { {true, 80}, {false, 60}, {true, 80}, {false, 0} };
+static const Beep PAT_START[] = { {true, 60}, {false, 80}, {true, 120}, {false, 80},
+                                  {true, 200}, {false, 0} };
+static const Beep PAT_OVER[]  = { {true, 800}, {false, 0} };
+static const Beep PAT_BONUS[] = { {true, 30}, {false, 30}, {true, 30}, {false, 0} };
+static const Beep *const PATTERNS[] = { PAT_HIT, PAT_START, PAT_OVER, PAT_BONUS };
 
 static void buzzerTask(void *p)
 {
@@ -587,12 +586,12 @@ static void buzzerTask(void *p)
         if (xQueueReceive(buzzerQueue, &ev, portMAX_DELAY) != pdTRUE)
             continue;
 
-        for (const Note *n = TUNES[ev]; n->ms != 0U; n++) {
-            setBuzzerTone(n->freq);
-            vTaskDelay(pdMS_TO_TICKS(n->ms));
+        for (const Beep *b = PATTERNS[ev]; b->ms != 0U; b++) {
+            setBuzzer(b->on);
+            vTaskDelay(pdMS_TO_TICKS(b->ms));
         }
-        setBuzzerTone(0);
-        vTaskDelay(pdMS_TO_TICKS(30));                  /* gap between tunes */
+        setBuzzer(false);
+        vTaskDelay(pdMS_TO_TICKS(100));                 /* gap between patterns */
     }
 }
 
@@ -636,7 +635,7 @@ static void fatalError(void)
 {
     taskDISABLE_INTERRUPTS();
     setRedLED(true);
-    setBuzzerTone(0);
+    setBuzzer(false);
     while (1) {}
 }
 
@@ -666,7 +665,8 @@ int main(void)
 
     /* Hardware init (UART2 is deferred to commRxTask). */
     initLED();
-    initPWM();
+    initBuzzer();
+    initServo();
 
     /* ---- Create FreeRTOS objects ---- */
     rxQueue        = xQueueCreate(RX_QUEUE_LEN, sizeof(TMessage));
@@ -706,7 +706,7 @@ int main(void)
     initADC();
 
     PRINTF("=== CG2271 A4 MCXC444 controller ===\r\n");
-    PRINTF("UART2 %u baud PTE22/23 | LED PTE31 | servo PTA5 | buzzer PTA12 | LDR PTB2\r\n",
+    PRINTF("UART2 %u baud PTE22/23 | LED PTE31 | servo PTA5 | buzzer PTD4 | LDR PTB0\r\n",
            BAUD_RATE);
 
     vTaskStartScheduler();
