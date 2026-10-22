@@ -140,11 +140,15 @@ const controller = {
   at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
   pendingFire: 0, fireSession: null, fireCount: 0,
   ldrValid: false, dark: false, ldrRaw: 0,
+  fireHeld: false, throttle: null, throttleApplied: null,
 };
 
 function clearController() {
   controller.at = -Infinity;
   controller.pendingFire = 0;
+  controller.fireHeld = false;
+  controller.throttle = null;
+  controller.throttleApplied = null;
   controller.ldrValid = false;
   controller.dark = false;
   S.stealth = false;
@@ -161,6 +165,9 @@ function receiveSensor(d) {
     d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
   controller.dark = controller.ldrValid && d.dark;
   controller.ldrRaw = controller.ldrValid ? d.ldrRaw : 0;
+  controller.fireHeld = d.fireHeld === true;
+  controller.throttle = Number.isFinite(d.throttle) && d.throttle >= 0 && d.throttle <= 100
+    ? d.throttle : null;
 
   const uint32 = n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
   let presses = 0;
@@ -195,8 +202,13 @@ function readInputs() {
   S.camX = controller.joyX;
   S.camY = controller.joyY;
   S.stealth = controller.ldrValid && controller.dark;
-  // Leave throttle on Shift/Ctrl; the MCX now has an LDR, not a potentiometer.
-  S.fire = S.fire || controller.pendingFire > 0;
+  // The encoder reports an absolute level (0..100). Apply it only when it changes,
+  // so Shift/Ctrl keep working between knob movements.
+  if (controller.throttle !== null && controller.throttle !== controller.throttleApplied) {
+    S.targetSpeed = C.MIN_SPD + (controller.throttle / 100) * (C.MAX_SPD - C.MIN_SPD);
+    controller.throttleApplied = controller.throttle;
+  }
+  S.fire = S.fire || controller.fireHeld || controller.pendingFire > 0;
 }
 
 /* ===== WebSocket ===== */

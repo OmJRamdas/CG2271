@@ -96,7 +96,7 @@ The pins were chosen from the MCXC444 reference manual's pin-mux table and the F
 
 Open `esp32/esp32_flight/esp32_flight.ino` in Arduino IDE and select **ESP32S2 Dev Module**. Keep `TiltController.h`, `McxLink.h`, and `ButtonEvents.h` in the same sketch directory. Install **WebSockets by Markus Sattler**, **Adafruit MPU6050**, **Adafruit Unified Sensor**, **Adafruit BusIO**, and **ArduinoJson 7** through Library Manager. Set the sketch's WiFi credentials and relay host/port/path before uploading; enter the same relay's `wss://` URL in the browser.
 
-Wiring on the ESP32 remains: UART TX GPIO1 / RX GPIO2, joystick X GPIO3 / Y GPIO5, fire button GPIO7 to ground with the internal pull-up, and MPU SDA GPIO8 / SCL GPIO9 at address `0x68`. Use common ground between boards.
+Wiring on the ESP32: UART TX GPIO1 / RX GPIO2, rotary encoder CLK GPIO6 / DT GPIO5 (module + to 3.3 V, SW unused), fire button GPIO7 to ground with the internal pull-up, and MPU SDA GPIO8 / SCL GPIO9 at address `0x68`. Use common ground between boards. The joystick is disabled by default (`USE_JOYSTICK 0`) because it shares GPIO5 with the encoder, so `joyX`/`joyY` are sent as 0. The encoder is decoded by pin-change interrupts into a 0-100 throttle level (`EncoderThrottle.h`); the browser maps a changed level to target speed, and Shift/Ctrl still adjust between knob movements. `fireHeld` (`FireHold.h`, 20 ms debounce) makes holding the button fire repeatedly; taps shorter than a packet still count through `fireCount`. Encoder detent size, direction and hold behaviour are untested on hardware.
 
 `TiltController` exclusively configures and samples the MPU. The sketch initializes Wire at 400 kHz with a 20 ms bus timeout. Sampling runs at 100 Hz, independently of 20 Hz sensor JSON transmission. All sensor calls run in the Arduino loop task; if another task later shares Wire, every user of the bus must use the same mutex.
 
@@ -118,7 +118,7 @@ MCX `$LDR` reports are forwarded as `ldrRaw`, `dark`, and `ldrValid`. An LDR rep
 
 ### Browser/ESP32 messages
 
-- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"yaw":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"ldrValid":true,"ldrRaw":1500,"dark":false}`.
+- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"yaw":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"fireHeld":false,"throttle":50,"ldrValid":true,"ldrRaw":1500,"dark":false}`.
 - Browser → ESP32: `{"type":"game_state","lives":3,"score":0,"mode":"PLAY"}` every 400 ms, including on the start screen (`IDLE`) and after game over (`OVER`). The 100-point hull is preserved; the servo's three segments use `ceil(health * 3 / 100)` (100–67 → 3, 66–34 → 2, 33–1 → 1, 0 → 0).
 - Browser → ESP32: `{"type":"event","event":"HIT","value":1}` for player damage; `START` at start/restart; `OVER` at game over; `BONUS` on a subsequent wave. Enemy kills update score/state, rather than triggering player-hit feedback. State is sent before each event. Legacy `ROLL`, `SCORE`, and `BOOST` UART commands are no longer used.
 

@@ -19,6 +19,10 @@ try {
     if ($LASTEXITCODE) { throw 'Tilt compilation failed' }
     & ./.build/test_tilt.exe
     if ($LASTEXITCODE) { throw 'Tilt tests failed' }
+    g++ -std=c++11 -Wall -Wextra -Werror -I esp32/esp32_flight esp32/tests/test_inputs.cpp -o .build/test_inputs.exe
+    if ($LASTEXITCODE) { throw 'Input compilation failed' }
+    & ./.build/test_inputs.exe
+    if ($LASTEXITCODE) { throw 'Input tests failed' }
     node --test game/tests/input.test.js
     if ($LASTEXITCODE) { throw 'Browser tests failed' }
     python mcx/tools/esp32_sim.py --selftest
