@@ -99,6 +99,10 @@ document.addEventListener('mousemove', e => {
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
+  if (e.code === 'KeyI' && !e.repeat) {
+    showInputs = !showInputs;
+    document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
+  }
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -140,8 +144,11 @@ const controller = {
   at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
   pendingFire: 0, fireSession: null, fireCount: 0,
   ldrValid: false, dark: false, ldrRaw: 0,
-  fireHeld: false, throttle: null, throttleApplied: null,
+  fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
 };
+// Press I during a game to show what the hardware controller is sending.
+let showInputs = false;
+let lastSentState = null;
 
 function clearController() {
   controller.at = -Infinity;
@@ -149,6 +156,7 @@ function clearController() {
   controller.fireHeld = false;
   controller.throttle = null;
   controller.throttleApplied = null;
+  controller.tiltValid = false;
   controller.ldrValid = false;
   controller.dark = false;
   S.stealth = false;
@@ -160,7 +168,8 @@ function receiveSensor(d) {
   if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
   controller.at = performance.now();
   for (const key of axes) controller[key] = clamp(d[key], -1, 1);
-  if (d.tiltValid === false) controller.pitch = controller.roll = controller.yaw = 0;
+  controller.tiltValid = d.tiltValid !== false;
+  if (!controller.tiltValid) controller.pitch = controller.roll = controller.yaw = 0;
   controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
     d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
   controller.dark = controller.ldrValid && d.dark;
@@ -246,13 +255,15 @@ function toggleWS() {
 
 function sendGameState() {
   if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({
+    const state = {
       type: 'game_state',
       // Preserve the game's 100-point hull; expose three gauge segments to MCX.
       lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
       score: Math.floor(clamp(S.score, 0, 9999999)),
       mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
-    }));
+    };
+    lastSentState = state;
+    ws.send(JSON.stringify(state));
   }
 }
 
@@ -427,6 +438,32 @@ function addKillMsg(text) {
   setTimeout(() => el.remove(), 2200);
 }
 
+/* ===== Input debug overlay (toggle with I) ===== */
+function inputDebugText() {
+  const f = v => (v >= 0 ? '+' : '') + v.toFixed(2);
+  const age = performance.now() - controller.at;
+  let link;
+  if (!ws || ws.readyState !== 1) link = 'disconnected (click Connect)';
+  else if (!Number.isFinite(age) || age > CONTROLLER_STALE_MS) link = 'connected, no sensor data from ESP32';
+  else link = 'connected (' + age.toFixed(0) + ' ms ago)';
+  const live = ws && ws.readyState === 1 && age <= CONTROLLER_STALE_MS;
+  const lines = ['LINK  ' + link];
+  if (live) {
+    lines.push('TILT  ' + (controller.tiltValid
+      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) + ' yaw ' + f(controller.yaw)
+      : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
+    lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
+    lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
+    lines.push('THR   ' + (controller.throttle !== null
+      ? controller.throttle + ' %'
+      : 'none: no $ENC from MCX (keyboard Shift/Ctrl)'));
+  }
+  lines.push('MCX   sent: ' + (lastSentState
+    ? lastSentState.mode + '  lives ' + lastSentState.lives + '  score ' + lastSentState.score
+    : 'nothing yet'));
+  return lines.join('\n');
+}
+
 function updateHUD() {
   document.getElementById('score').textContent = S.score;
   document.getElementById('kills').textContent = S.kills + ' KILL' + (S.kills !== 1 ? 'S' : '');
@@ -442,6 +479,7 @@ function updateHUD() {
       : 'linear-gradient(90deg,#ef4444,#dc2626)';
   document.getElementById('speed-box').textContent = 'SPD: ' + (S.speed * 100).toFixed(0);
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
+  if (showInputs) document.getElementById('input-debug').textContent = inputDebugText();
 
   const stealth = S.stealth ? ' · STEALTH' : '';
   document.getElementById('controls-help').textContent =

@@ -69,10 +69,13 @@ TiltController tilt(originalDirections());
  *  WIFI & WEBSOCKET CONFIG
  *  *** EDIT THESE BEFORE UPLOADING ***
  * ════════════════════════════════════════════ */
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char* WS_HOST   = "your-relay.glitch.me";  // e.g. "cg2271-relay.glitch.me"
-const uint16_t WS_PORT = 443;
+const char* WIFI_SSID = "S22";
+const char* WIFI_PASS = "pzlc1245";
+// Local relay: laptop's IPv4 on the hotspot (ipconfig), port 3000, WS_USE_SSL 0.
+// Cloud relay: e.g. "cg2271-relay.onrender.com", port 443, WS_USE_SSL 1.
+#define WS_USE_SSL      0
+const char* WS_HOST   = "10.166.151.55";
+const uint16_t WS_PORT = 3000;
 const char* WS_PATH    = "/";
 
 /* ════════════════════════════════════════════
@@ -327,11 +330,16 @@ void setup() {
     Serial.printf("\n[WiFi] Connected!  IP: %s\n", WiFi.localIP().toString().c_str());
   }
 
-  // WebSocket (SSL for Glitch/HTTPS)
+  // WebSocket: plain ws:// to a local relay, or wss:// to a cloud (HTTPS) relay
+#if WS_USE_SSL
   webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+#else
+  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+#endif
   webSocket.onEvent(onWebSocketEvent);
   webSocket.setReconnectInterval(5000);
-  Serial.printf("[WS] Target: wss://%s%s\n", WS_HOST, WS_PATH);
+  Serial.printf("[WS] Target: %s://%s:%u%s\n", WS_USE_SSL ? "wss" : "ws", WS_HOST,
+                (unsigned)WS_PORT, WS_PATH);
 
   // Begin after blocking startup work; loop() collects calibration samples.
   fireSession = esp_random();
