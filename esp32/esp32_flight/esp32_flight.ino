@@ -104,6 +104,8 @@ EncoderThrottle encoder;
 portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
 FireHold fireHold;
 int lastPrintedThrottle = -1;
+bool lastPrintedHeld = false;
+uint32_t lastPrintedPresses = 0;
 
 McxLink mcx;
 char uartBuf[McxLink::MAX_LINE + 1];
@@ -387,6 +389,11 @@ void loop() {
     if (throttle != lastPrintedThrottle) {
       Serial.printf("[ENC] throttle %d%%\n", throttle);
       lastPrintedThrottle = throttle;
+    }
+    if (fireHold.held() != lastPrintedHeld || presses != lastPrintedPresses) {
+      Serial.printf("[BTN] held=%d taps=%lu\n", fireHold.held(), static_cast<unsigned long>(presses));
+      lastPrintedHeld = fireHold.held();
+      lastPrintedPresses = presses;
     }
     if (sendSensorData(tilt.latest(), jx, jy, presses, throttle, fireHold.held()))
       lastSentFireCount = presses;
