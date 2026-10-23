@@ -37,6 +37,8 @@
 #include "McxLink.h"
 #include "ButtonEvents.h"
 #include "TiltController.h"
+#include "EncoderThrottle.h"
+#include "FireHold.h"
 
 // Original accelerometer convention: +X -> +pitch, +Y -> +roll.
 // The new estimator uses aerospace pitch (-X), so invert only its output.
@@ -56,8 +58,11 @@ TiltController tilt(originalDirections());
  * ════════════════════════════════════════════ */
 #define UART_TX_PIN   1    // Serial1 TX → MCX RX
 #define UART_RX_PIN   2    // Serial1 RX ← MCX TX
+#define USE_JOYSTICK  0    // 0: joystick replaced by the encoder (they clash on GPIO5)
 #define JOY_X_PIN     3    // Joystick X axis (ADC)
-#define JOY_Y_PIN     5    // Joystick Y axis (ADC)
+#define JOY_Y_PIN     5    // Joystick Y axis (ADC); same pin as ENC_DT_PIN
+#define ENC_CLK_PIN   6    // Rotary encoder CLK (module + to 3.3 V)
+#define ENC_DT_PIN    5    // Rotary encoder DT
 #define BTN_PIN       7    // Fire button (active LOW, internal pull-up)
 #define I2C_SDA_PIN   8    // MPU-6050 SDA
 #define I2C_SCL_PIN   9    // MPU-6050 SCL
@@ -93,6 +98,14 @@ int joyXCenter = 2048, joyYCenter = 2048;
 ButtonEvents button;
 portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t fireSession = 0, lastSentFireCount = 0;
+
+// Encoder throttle (updated in the pin-change ISR) and debounced held-fire level.
+EncoderThrottle encoder;
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+FireHold fireHold;
+int lastPrintedThrottle = -1;
+bool lastPrintedHeld = false;
+uint32_t lastPrintedPresses = 0;
 
 McxLink mcx;
 char uartBuf[McxLink::MAX_LINE + 1];
@@ -143,6 +156,26 @@ static uint32_t buttonCount() {
   const uint32_t count = button.count();
   portEXIT_CRITICAL(&buttonMux);
   return count;
+}
+
+/* ════════════════════════════════════════════
+ *  ROTARY ENCODER (interrupt on both pins)
+ * ════════════════════════════════════════════ */
+static uint8_t IRAM_ATTR encoderPins() {
+  return (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
+}
+
+void IRAM_ATTR encoderISR() {
+  portENTER_CRITICAL_ISR(&encoderMux);
+  encoder.update(encoderPins());
+  portEXIT_CRITICAL_ISR(&encoderMux);
+}
+
+static int throttleLevel() {
+  portENTER_CRITICAL(&encoderMux);
+  const int level = encoder.level();
+  portEXIT_CRITICAL(&encoderMux);
+  return level;
 }
 
 /* ════════════════════════════════════════════
@@ -226,19 +259,22 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 /* ════════════════════════════════════════════
  *  BUILD & SEND SENSOR JSON
  * ════════════════════════════════════════════ */
-static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint32_t presses) {
+static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint32_t presses,
+                           int throttle, bool fireHeld) {
   if (!wsConnected) return false;
   const bool ldrValid = mcx.hasLdr && uint32_t(millis() - mcx.ldrAt) <= LDR_STALE_MS;
-  char json[384];
+  char json[448];
   const int len = snprintf(json, sizeof(json),
     "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
     "\"tiltValid\":%s,\"joyX\":%.3f,\"joyY\":%.3f,\"fire\":%s,"
     "\"fireSession\":%lu,\"fireCount\":%lu,\"firePending\":%lu,"
+    "\"fireHeld\":%s,\"throttle\":%d,"
     "\"ldrValid\":%s,\"ldrRaw\":%u,\"dark\":%s}",
     reading.pitch, reading.roll, reading.yaw, reading.valid ? "true" : "false", jx, jy,
     presses != lastSentFireCount ? "true" : "false",
     static_cast<unsigned long>(fireSession), static_cast<unsigned long>(presses),
     static_cast<unsigned long>(uint32_t(presses - lastSentFireCount)),
+    fireHeld ? "true" : "false", throttle,
     ldrValid ? "true" : "false", mcx.ldrRaw, ldrValid && mcx.ldrDark ? "true" : "false");
   return len > 0 && len < static_cast<int>(sizeof(json)) && webSocket.sendTXT(json, len);
 }
@@ -284,8 +320,18 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_PIN), buttonISR, FALLING);
   Serial.printf("[BTN] GPIO%d, interrupt on FALLING\n", BTN_PIN);
 
+  // Rotary encoder: latch the idle state first, then interrupt on every change.
+  pinMode(ENC_CLK_PIN, INPUT_PULLUP);
+  pinMode(ENC_DT_PIN, INPUT_PULLUP);
+  encoder.begin(encoderPins());
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
+  Serial.printf("[ENC] CLK=GPIO%d DT=GPIO%d, throttle %d%%\n", ENC_CLK_PIN, ENC_DT_PIN, throttleLevel());
+
+#if USE_JOYSTICK
   // Joystick calibration (read center position at rest)
   calibrateJoystick();
+#endif
 
   // WiFi
   Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
@@ -330,13 +376,27 @@ void loop() {
   readUART();
   const uint32_t now = millis();
   serviceMCX(now);
+  fireHold.update(now, digitalRead(BTN_PIN) == LOW);
 
   if (uint32_t(now - lastSendTime) >= SEND_INTERVAL_MS) {
     lastSendTime = now;
-    float jx, jy;
+    float jx = 0, jy = 0;
+#if USE_JOYSTICK
     readJoystick(jx, jy);
+#endif
     const uint32_t presses = buttonCount();
-    if (sendSensorData(tilt.latest(), jx, jy, presses)) lastSentFireCount = presses;
+    const int throttle = throttleLevel();
+    if (throttle != lastPrintedThrottle) {
+      Serial.printf("[ENC] throttle %d%%\n", throttle);
+      lastPrintedThrottle = throttle;
+    }
+    if (fireHold.held() != lastPrintedHeld || presses != lastPrintedPresses) {
+      Serial.printf("[BTN] held=%d taps=%lu\n", fireHold.held(), static_cast<unsigned long>(presses));
+      lastPrintedHeld = fireHold.held();
+      lastPrintedPresses = presses;
+    }
+    if (sendSensorData(tilt.latest(), jx, jy, presses, throttle, fireHold.held()))
+      lastSentFireCount = presses;
   }
   delay(1);
 }

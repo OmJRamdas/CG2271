@@ -188,3 +188,55 @@ test('WebSocket close clears axes immediately and initial open publishes state',
   assert.equal(g.run('S.pIn'), 0);
   assert.equal(g.run('controller.pendingFire'), 0);
 });
+
+test('encoder throttle sets target speed only when the level changes', () => {
+  const g = game();
+  g.packet({ throttle: 100 });
+  g.time(0);
+  g.run('readInputs()');
+  assert.equal(g.run('S.targetSpeed'), g.run('C.MAX_SPD'));
+  g.run('S.targetSpeed = 1.0');  // e.g. Shift/Ctrl adjusted it afterwards
+  g.time(50);
+  g.packet({ throttle: 100 });
+  g.run('readInputs()');
+  assert.equal(g.run('S.targetSpeed'), 1.0);
+  g.packet({ throttle: 0 });
+  g.run('readInputs()');
+  assert.equal(g.run('S.targetSpeed'), g.run('C.MIN_SPD'));
+});
+
+test('invalid throttle values are ignored', () => {
+  const g = game();
+  g.run('S.targetSpeed = 1.2');
+  for (const throttle of [-1, 101, NaN, 'x', undefined]) {
+    g.packet({ throttle });
+    g.time(0);
+    g.run('readInputs()');
+    assert.equal(g.run('S.targetSpeed'), 1.2);
+  }
+});
+
+test('held fire persists across frames and releases cleanly', () => {
+  const g = game();
+  g.packet({ fireHeld: true });
+  for (const now of [0, 16, 100, 250]) {
+    g.time(now);
+    g.run('readInputs()');
+    assert.equal(g.run('S.fire'), true);
+  }
+  g.time(260);
+  g.packet({ fireHeld: false });
+  g.run('readInputs()');
+  assert.equal(g.run('S.fire'), false);
+});
+
+test('held fire clears when the controller goes stale', () => {
+  const g = game();
+  g.time(0);
+  g.packet({ fireHeld: true });
+  g.run('readInputs()');
+  assert.equal(g.run('S.fire'), true);
+  g.time(1000);
+  g.run('readInputs()');
+  assert.equal(g.run('S.fire'), false);
+});
