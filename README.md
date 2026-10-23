@@ -238,6 +238,26 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 .venv\Scripts\python mcx\tools\esp32_sim.py COM7 --interactive
 ```
 
+## Run locally (relay on a laptop)
+
+For bench testing without a deployed relay. The demo itself should use a cloud relay: set `WS_USE_SSL 1` with its `wss://` host on port 443.
+
+1. **Wiring:** boards linked over UART (ESP GPIO1 → PTE23, GPIO2 ← PTE22, common GND). Sensors and actuators are wired as in the tables above.
+2. **MCX:** debug `cg2271project_v1` in MCUXpresso, with the terminal at 115200.
+   - Expect the controller banner, then the red LED slow-blinking ("link lost") until the ESP32 starts sending.
+3. **Network:** turn on a phone hotspot on **2.4 GHz** (iPhone: *Maximize Compatibility*) and connect the laptop to it. Note the laptop's Wireless LAN IPv4 address from `ipconfig`.
+4. **Relay:** run `cd relay`, then `npm install` (first time only), then `node server.js`. Allow Node through Windows Firewall on private networks.
+5. **ESP32:** in `esp32_flight.ino`, set `WIFI_SSID`/`WIFI_PASS`, `WS_HOST` to the laptop's IPv4, `WS_PORT 3000` and `WS_USE_SSL 0`. Upload, then open Serial Monitor at 115200.
+   - Keep the board still for about 2 s while it calibrates.
+   - The relay window should print `ESP32 registered`.
+   - Don't commit your Wi-Fi password.
+6. **Game:** open `game/index.html` in a browser (it needs internet, for Three.js). Enter `ws://localhost:3000` and click **Connect**. The relay window should print `Game registered`.
+7. **Check both directions:**
+   - **ESP32 → game:** tilt steers, the joystick orbits the camera, the button fires, and the encoder knob changes speed.
+   - **Game → MCX:** the red LED is solid during play, triple-flashes and beeps on a hit, and fast-blinks at game over.
+
+If the ESP32 keeps printing `[WS] Disconnected`, check `WS_HOST`, the firewall, and whether the hotspot blocks devices from reaching each other.
+
 ## Hardware test (wiring check for both boards)
 
 These are two standalone programs that print every sensor reading and actuator step to a serial monitor. Run them before integrating.
