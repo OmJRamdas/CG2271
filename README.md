@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-A tilt-controlled browser flight game where physical sensors on the ESP32 and MCXC444 drive a Three.js airplane through a cloud-hosted WebSocket relay. The player tilts the MPU-6050 to steer, uses a joystick to orbit the camera, presses a button to fire, and covers a light sensor for stealth mode. Game events feed back to the MCXC444 to drive LEDs, a buzzer, and a servo.
+A tilt-controlled browser flight game where physical sensors on the ESP32 and MCXC444 drive a Three.js airplane through a cloud-hosted WebSocket relay. The player tilts the MPU-6050 to steer, uses a joystick to orbit the camera, presses a button to fire, and turns a rotary encoder on the MCXC444 to set the throttle. Game events feed back to the MCXC444 to drive LEDs, a buzzer, and a servo.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
  │  Tasks:                                                │
  │    commRxTask (pri 3) — parse frames, ACK/NAK, state   │
  │    commTxTask (pri 2) — sole owner of UART TX          │
- │    ldrTask    (pri 2) — LDR ADC polling, report        │
+ │    encoderTask(pri 2) — encoder throttle, report       │
  │    ledTask    (pri 1) — red LED patterns               │
  │    buzzerTask (pri 1) — buzzer beep patterns (GPIO)    │
  │    servoTask  (pri 1) — lives gauge (TPM0 PWM)         │
@@ -56,7 +56,7 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
  │    - Servo SG90 PTA5   D5 (external, PWM)              │
  │                                                        │
  │  Sensor:                                               │
- │    - LDR (photoresistor) PTB0 A0 (ADC0_SE8)            │
+ │    - Rotary encoder PTA12 D3 / PTA13 D8 (pin IRQ)      │
  └────────────────────────────────────────────────────────┘
 ```
 
@@ -69,7 +69,7 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | 1 | GY-521 MPU-6050 | ESP32-S2 | I2C (SDA/SCL) | Polled (100 Hz) | Tilt → pitch & roll of airplane |
 | 2 | Joystick module | ESP32-S2 | 2× ADC | Polled (ADC) | Camera orbit (X/Y); joystick switch is not connected by this sketch |
 | 3 | Push button | ESP32-S2 | GPIO | Interrupt (falling edge) | Fire (one shot per debounced press) |
-| 4 | LDR (photoresistor) | MCXC444 | ADC0_SE8, PTB0 (A0) | Polled (ldrTask, 100 ms) | Stealth indicator and dimmed aircraft navigation lights |
+| 4 | Rotary encoder | MCXC444 | CLK PTA12 (D3), DT PTA13 (D8) | Interrupt (PORTA pin change) | Throttle 0–100 % |
 
 ### Actuators (3 required)
 
@@ -88,15 +88,16 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | GND | GND | — | ESP32 GND (common ground is required) |
 | Servo signal | PTA5 | D5 | SG90 orange wire (power the servo from 5 V, GND shared) |
 | Buzzer signal | PTD4 | D10 | buzzer S pin (VCC → 3.3 V, GND → GND) |
-| LDR | PTB0 | A0 | 3.3 V — LDR — A0 — 10 kΩ — GND |
+| Encoder CLK | PTA12 | D3 | encoder CLK |
+| Encoder DT | PTA13 | D8 | encoder DT (module + → 3.3 V, GND → GND, SW unused) |
 
-The pins were chosen from the MCXC444 reference manual's pin-mux table and the FRDM schematic (`mcx/extras/`). The servo is on PTA5 because PTD0 (the old servo pin) isn't on any header; it's wired to the onboard LCD. PTB0 also carries the MCU-Link I2C clock. If the LDR readings are noisy, move it to PTB2 (header A2) by setting `LDR_PIN 2U` and `LDR_ADC_CH 12U`.
+The pins were chosen from the MCXC444 reference manual's pin-mux table and the FRDM schematic (`mcx/extras/`). The servo is on PTA5 because PTD0 (the old servo pin) isn't on any header; it's wired to the onboard LCD. The encoder uses PTA12/PTA13 because PORTA has a pin-change interrupt (PORTB has none). If the throttle moves the wrong way when you turn the knob, set `ENC_REVERSE true`.
 
 ## ESP32 tilt integration and controls
 
 Open `esp32/esp32_flight/esp32_flight.ino` in Arduino IDE and select **ESP32S2 Dev Module**. Keep `TiltController.h`, `McxLink.h`, and `ButtonEvents.h` in the same sketch directory. Install **WebSockets by Markus Sattler**, **Adafruit MPU6050**, **Adafruit Unified Sensor**, **Adafruit BusIO**, and **ArduinoJson 7** through Library Manager. Set the sketch's WiFi credentials and relay host/port/path before uploading; enter the same relay's `wss://` URL in the browser.
 
-Wiring on the ESP32: UART TX GPIO1 / RX GPIO2, rotary encoder CLK GPIO6 / DT GPIO5 (module + to 3.3 V, SW unused), fire button GPIO7 to ground with the internal pull-up, and MPU SDA GPIO8 / SCL GPIO9 at address `0x68`. Use common ground between boards. The joystick is disabled by default (`USE_JOYSTICK 0`) because it shares GPIO5 with the encoder, so `joyX`/`joyY` are sent as 0. The encoder is decoded by pin-change interrupts into a 0-100 throttle level (`EncoderThrottle.h`); the browser maps a changed level to target speed, and Shift/Ctrl still adjust between knob movements. `fireHeld` (`FireHold.h`, 20 ms debounce) makes holding the button fire repeatedly; taps shorter than a packet still count through `fireCount`. Encoder detent size, direction and hold behaviour are untested on hardware.
+Wiring on the ESP32: UART TX GPIO1 / RX GPIO2, joystick X GPIO3 / Y GPIO5 (`USE_JOYSTICK 1`), fire button GPIO7 to ground with the internal pull-up, and MPU SDA GPIO8 / SCL GPIO9 at address `0x68`. Use common ground between boards. The rotary encoder is on the MCXC444 (see MCXC444 wiring), which sends its 0–100 level as `$ENC`; the ESP32 forwards it as `throttle` while fresh (≤ 1500 ms) and sends `-1` otherwise, so the browser falls back to Shift/Ctrl. The browser maps a changed level to target speed, and Shift/Ctrl still adjust between knob movements. `EncoderThrottle.h` is no longer used by the sketch. `fireHeld` (`FireHold.h`, 20 ms debounce) makes holding the button fire repeatedly; taps shorter than a packet still count through `fireCount`. Encoder detent size, direction and hold behaviour are untested on hardware.
 
 `TiltController` exclusively configures and samples the MPU. The sketch initializes Wire at 400 kHz with a 20 ms bus timeout. Sampling runs at 100 Hz, independently of 20 Hz sensor JSON transmission. All sensor calls run in the Arduino loop task; if another task later shares Wire, every user of the bus must use the same mutex.
 
@@ -110,15 +111,15 @@ The joystick retains its original X/Y directions, 80-count deadzone, and camera-
 
 The fire button retains falling-edge interrupts and 50 ms debounce. Accepted edges increment a counter under a shared ISR/loop critical section. Packets include `fireSession` (per ESP32 boot), `fireCount` (cumulative accepted edges), `firePending` (edges since the last successful send), and the compatible `fire` boolean. The ESP32 advances its sent counter only after WebSocket send succeeds. The browser queues new presses, ignores duplicate counters, recovers skipped packets within a session, and consumes one press only when a projectile is actually fired. A later `fire:false` packet or an active weapon cooldown cannot erase a queued press. Held Space keeps its original repeated-fire behavior. Presses received outside gameplay are not queued; disconnects, controller timeout, restart, and game over clear pending shots.
 
-### Sensor validity and LDR
+### Sensor validity and throttle
 
 `latest()` returns zero controls and `valid=false` during calibration, a sensor fault, freefall, or when the last usable sample is over 150 ms old. These neutral readings are still transmitted alongside joystick/button data. The JSON includes `tiltValid` for the browser. The MPU presence check catches common disconnects, and finite/range checks reject implausible values. Adafruit's `getEvent()` does not expose every underlying I2C read failure: `valid` means a calibrated, plausible, timely reading, not a guarantee that every byte was successfully transported. Verify disconnect behavior on the real wiring.
 
-MCX `$LDR` reports are forwarded as `ldrRaw`, `dark`, and `ldrValid`. An LDR report expires after 1000 ms. Fresh darkness displays STEALTH and dims the player's red/green navigation lamps to 15%; stale or invalid LDR data restores normal lamps. The current MCX has an LDR, so there is no potentiometer throttle field; throttle remains on Shift/Ctrl.
+MCX `$ENC` reports are forwarded as `throttle` (0–100). An encoder report expires after 1500 ms, after which `throttle` is `-1` and the browser keeps its own throttle. The LDR (and the game's stealth mode) has been removed; the browser simply never receives `ldrValid: true`, so stealth stays off.
 
 ### Browser/ESP32 messages
 
-- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"yaw":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"fireHeld":false,"throttle":50,"ldrValid":true,"ldrRaw":1500,"dark":false}`.
+- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"yaw":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"fireHeld":false,"throttle":50}` (`throttle` is `-1` when no fresh MCX encoder reading).
 - Browser → ESP32: `{"type":"game_state","lives":3,"score":0,"mode":"PLAY"}` every 400 ms, including on the start screen (`IDLE`) and after game over (`OVER`). The 100-point hull is preserved; the servo's three segments use `ceil(health * 3 / 100)` (100–67 → 3, 66–34 → 2, 33–1 → 1, 0 → 0).
 - Browser → ESP32: `{"type":"event","event":"HIT","value":1}` for player damage; `START` at start/restart; `OVER` at game over; `BONUS` on a subsequent wave. Enemy kills update score/state, rather than triggering player-hit feedback. State is sent before each event. Legacy `ROLL`, `SCORE`, and `BOOST` UART commands are no longer used.
 
@@ -149,11 +150,11 @@ $<TYPE>,<seq>,<fields...>*<CK>\n
 |---|---|
 | `$ACK,<seq>*CK` | Frame `<seq>` was valid and has been applied |
 | `$NAK,<seq>*CK` | Frame `<seq>` was rejected (bad checksum, bad format or out-of-range value). The ESP32 can resend it. `seq` is 0 if it couldn't be read. |
-| `$LDR,<seq>,<raw 0-4095>,<dark 0/1>*CK` | Light sensor reading: every 200 ms, and immediately when dark/light changes |
+| `$ENC,<seq>,<level 0-100>*CK` | Rotary encoder throttle: immediately on every detent change, and every 500 ms as a heartbeat |
 
 ### Flow control
 
-- **Every ESP32 command is acknowledged.** The ESP32 uses stop-and-wait, resending the identical sequence/body on `NAK` or after a 200 ms ACK timeout, with at most three retries. MCX ACK/NAK and LDR telemetry do not themselves need acknowledgments. The MCX re-ACKs an exact retry of its last accepted frame without reapplying actuator effects. A full 16-event queue or an exhausted retry budget increments an ESP32 diagnostic counter (`droppedEvents` / `failedFrames`); the loop continues. Game states are coalesced and sent when changed or due for a 400 ms heartbeat, with pending retries taking priority.
+- **Every ESP32 command is acknowledged.** The ESP32 uses stop-and-wait, resending the identical sequence/body on `NAK` or after a 200 ms ACK timeout, with at most three retries. MCX ACK/NAK and encoder telemetry do not themselves need acknowledgments. The MCX re-ACKs an exact retry of its last accepted frame without reapplying actuator effects. A full 16-event queue or an exhausted retry budget increments an ESP32 diagnostic counter (`droppedEvents` / `failedFrames`); the loop continues. Game states are coalesced and sent when changed or due for a 400 ms heartbeat, with pending retries taking priority.
 - **Link watchdog:** if the MCX gets no valid frame for 2 s, it marks the link as lost and the red LED slow-blinks. The link recovers automatically on the next valid frame.
 
 ### What the MCXC444 does with it
@@ -178,7 +179,7 @@ Code: [mcx/source/cg2271project_v1.c](mcx/source/cg2271project_v1.c). The kernel
 |------|----------|-------|------|
 | `commRxTask` | 3 | MINIMAL+200 | Parses and validates frames from `rxQueue`; ACKs or NAKs each one; updates `GameState` under the mutex; dispatches events to the actuator tasks; runs the 2 s link watchdog |
 | `commTxTask` | 2 | MINIMAL+80 | The only task that writes to UART2: takes a frame from `txQueue`, starts the interrupt-driven send, then waits on `txDoneSem` |
-| `ldrTask` | 2 | MINIMAL+200 | Every 100 ms: starts an ADC conversion and waits for the ISR's notification. Applies a 4-sample moving average and dark/light hysteresis, then queues `$LDR` |
+| `encoderTask` | 2 | MINIMAL+200 | Woken by the PORTA ISR's notification when the throttle changes (or every 500 ms). Reads the level in a critical section and queues `$ENC` |
 | `ledTask` | 1 | MINIMAL+40 | Flash patterns from `ledQueue`; otherwise shows the mode or link state |
 | `buzzerTask` | 1 | MINIMAL+40 | Plays an on/off beep pattern per event from `buzzerQueue` on the active buzzer (GPIO; the buzzer makes its own tone) |
 | `servoTask` | 1 | MINIMAL+40 | Lives gauge with slew limiting, updated every 50 ms |
@@ -190,19 +191,20 @@ Both ISRs are short and never block. They use only FromISR APIs, and the ISR nev
 - **`UART2_FLEXIO_IRQHandler`** (NVIC priority 1)
   - Receive: assembles characters into a line, discards lines that overflow or have UART errors, and hands complete lines over with `xQueueSendFromISR`.
   - Send: while TIE is set, sends `txBuf` one character per TDRE (as in the AS03 pattern), then gives `txDoneSem`.
-- **`ADC0_IRQHandler`** (NVIC priority 2): reads the conversion result and wakes `ldrTask` with `vTaskNotifyGiveFromISR`.
+- **`PORTA_IRQHandler`** (NVIC priority 2): on every encoder pin edge, clears the flag, decodes the quadrature step (`encoder.c`), and wakes `encoderTask` with `vTaskNotifyGiveFromISR` when the throttle level changes.
 
 ### Synchronization & resource protection
 
 | Object | Type | Between | Protects / signals |
 |---|---|---|---|
 | `rxQueue` (5 × 66 B) | Queue | UART ISR → commRxTask | complete received lines |
-| `txQueue` (6 × 32 B) | Queue | commRx/ldr → commTxTask | outgoing frames, with UART TX owned by a single task |
+| `txQueue` (6 × 32 B) | Queue | commRx/encoder → commTxTask | outgoing frames, with UART TX owned by a single task |
 | `ledQueue`, `buzzerQueue` | Queue | commRxTask → actuators | event commands |
 | `gameStateMutex` | Mutex | commRx (writes) ↔ led/servo (read) | the shared `GameState` struct |
 | `printMutex` | Mutex | all tasks that log | the debug console (stops `PRINTF` output interleaving) |
 | `txDoneSem` | Binary semaphore | UART ISR → commTxTask | "frame sent", so `txBuf` can be reused |
-| task notification | Notification | ADC ISR → ldrTask | "conversion done" (lighter than a semaphore) |
+| task notification | Notification | PORTA ISR → encoderTask | "throttle changed" (lighter than a semaphore) |
+| critical section | `taskENTER_CRITICAL` | PORTA ISR ↔ encoderTask | the encoder decoder state |
 
 ### RTOS configuration (`FreeRTOSConfig_Gen.h`)
 
@@ -221,7 +223,7 @@ From the repo root on Windows with Node.js, Python, and GCC/G++ on PATH:
 
 This runs the existing MCX parser suite, ESP32/MCX interoperability checks against the real C parser (including checksums, ACK/NAK, lost-ACK duplicates, bounded retries, queue limits, and sequence wrap), tilt/button tests using deterministic sensor/clock substitutes, browser input/shot/state tests using the production JavaScript with a rendering substitute, and the UART simulator self-test. Outputs go into ignored `.build/`. Sensor substitutes test algorithm and integration behavior; they do not replace an ESP32 firmware build or real I2C testing.
 
-Before a demo, compile/upload for ESP32-S2 with the listed libraries, then verify: calibration while still and while moving; both directions of each axis; no movement at neutral; yaw returning to zero when rotation stops; quick button presses across packet intervals and cooldowns; MPU unplug/reconnect and explicit `i` recovery; browser/relay interruption and keyboard fallback; LDR cover/uncover and stale telemetry; and MCX START/HIT/BONUS/OVER feedback. Confirm a lost ACK does not replay feedback and prolonged cloud loss triggers the MCX watchdog.
+Before a demo, compile/upload for ESP32-S2 with the listed libraries, then verify: calibration while still and while moving; both directions of each axis; no movement at neutral; yaw returning to zero when rotation stops; quick button presses across packet intervals and cooldowns; MPU unplug/reconnect and explicit `i` recovery; browser/relay interruption and keyboard fallback; encoder turns in both directions and stale `$ENC` telemetry; and MCX START/HIT/BONUS/OVER feedback. Confirm a lost ACK does not replay feedback and prolonged cloud loss triggers the MCX watchdog.
 
 
 ```sh
@@ -235,6 +237,28 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 .venv\Scripts\python mcx\tools\esp32_sim.py COM7 --corrupt 3   # every 3rd frame corrupted, expect NAK
 .venv\Scripts\python mcx\tools\esp32_sim.py COM7 --interactive
 ```
+
+## Hardware test (wiring check for both boards)
+
+These are two standalone programs that print every sensor reading and actuator step to a serial monitor. Run them before integrating.
+
+**MCXC444:** [mcx/hwtest/source/cg2271_hwtest.c](mcx/hwtest/source/cg2271_hwtest.c)
+1. In MCUXpresso, create a new project `cg2271_hwtest` with the same settings as the main one: FRDM-MCXC444, RTOS, heap_4 only, RTOS template, printf redirected to UART.
+2. Replace its `source/cg2271_hwtest.c` with the file from the repo, and copy [mcx/source/encoder.c](mcx/source/encoder.c) and `encoder.h` into the same `source/` folder. Copy [mcx/FreeRTOSConfig_Gen.h](mcx/FreeRTOSConfig_Gen.h) over `freertos/freertos-kernel/template/ARM_CM0/FreeRTOSConfig_Gen.h`.
+3. Build, debug, and open the MCUXpresso terminal at 115200.
+   - **Actuators:** at boot, the LED lights for 1 s, the buzzer beeps 3 times, and the servo sweeps 0° → 90° → 180° → 90°, with each step printed. Press **SW3** to run it again.
+   - **Encoder:** each detent prints `[ENC]` with the level moving by 5 %. If it moves the wrong way, set `ENC_REVERSE true`; if one click moves it by 10 % or needs two clicks, the knob has a different detent size. Every 5 s a summary shows how many edges were seen (0 edges = wiring fault).
+   - **Link:** `[LINK] rx: PING,n` lines appear once the ESP32 test is running and wired up.
+
+**ESP32-S2:** [esp32/hw_test/hw_test.ino](esp32/hw_test/hw_test.ino), which needs no extra libraries. Upload it with the board set to *ESP32S2 Dev Module*, then open Serial Monitor at 115200.
+- **At startup:**
+  - The I2C scan should list `0x68`, followed by `[MPU] WHO_AM_I ... PASS`.
+  - The joystick's resting centre should be about 2000 on each axis.
+- **Every 200 ms**, a status line prints, e.g. `MPU pitch= +12.3 roll= -4.1 | JOY x=2051 y=1987 | BTN presses=3 | LINK sent=12 ok=12 lost=0 rtt=18ms`.
+  - Tilting changes pitch and roll.
+  - The joystick should span roughly 0–4095 on each axis.
+  - Each button press counts up.
+- **With both boards wired** (ESP GPIO1 → PTE23, GPIO2 ← PTE22, common GND), `ok` counts up and `lost` stays at 0. If pings are lost, it prints a wiring hint.
 
 ## Cloud / Online Function
 
@@ -261,18 +285,18 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 
 | Requirement | Satisfied | How |
 |-------------|-----------|-----|
-| 4 sensors | ✅ | MPU-6050, joystick, button, LDR |
+| 4 sensors | ✅ | MPU-6050, joystick, button, rotary encoder |
 | 3 actuators | ✅ | Red LED, buzzer, servo |
-| ≥1 sensor on MCXC444 | ✅ | LDR on MCXC444 ADC |
+| ≥1 sensor on MCXC444 | ✅ | Rotary encoder on MCXC444 PTA12/PTA13 |
 | ≤1 onboard actuator | ✅ | Red LED only; buzzer + servo external |
-| Polling + interrupt | ✅ | Polled: LDR (ldrTask, 100 ms) and the ESP32's MPU-6050. Interrupt-driven: the ESP32's button/touch sensor |
-| ≥1 ISR | ✅ | UART2 ISR (RX + TX) and ADC0 ISR on the MCXC444 |
+| Polling + interrupt | ✅ | Polled: the ESP32's MPU-6050 and joystick. Interrupt-driven: the MCX rotary encoder (PORTA ISR) and the ESP32's button |
+| ≥1 ISR | ✅ | UART2 ISR (RX + TX) and PORTA encoder ISR on the MCXC444 |
 | ≥3 tasks | ✅ | 6 tasks |
 | ≥1 mutex/semaphore | ✅ | gameStateMutex, printMutex, txDoneSem (binary) |
 | ≥1 queue | ✅ | rxQueue, txQueue, ledQueue, buzzerQueue |
 | Time-slicing | ✅ | `configUSE_TIME_SLICING 1`; led/buzzer/servo share priority 1 |
 | Pre-emption | ✅ | `configUSE_PREEMPTION 1`; commRxTask (priority 3) pre-empts the other tasks |
-| Bi-directional UART | ✅ | ESP32→MCX: `$GS`/`$EV`. MCX→ESP32: `$LDR` and `$ACK`/`$NAK`. Frames are checksummed, sequenced and acknowledged |
+| Bi-directional UART | ✅ | ESP32→MCX: `$GS`/`$EV`. MCX→ESP32: `$ENC` and `$ACK`/`$NAK`. Frames are checksummed, sequenced and acknowledged |
 | Cloud/internet | ✅ | ESP32 WebSocket client → cloud relay |
 | Non-trivial online | ✅ | Real-time game data exchange |
 | Coherent product | ✅ | All sensors/actuators serve the flight game |
@@ -284,7 +308,7 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 - Wire joystick (2× ADC for camera orbit).
 - Wire push button with debounce.
 - Package sensor readings into JSON for WebSocket.
-- UART to MCXC444 with checksummed state/events, ACK/NAK retries and LDR reception.
+- UART to MCXC444 with checksummed state/events, ACK/NAK retries and encoder throttle reception.
 
 ### Stream 2 — ESP32 WiFi + WebSocket Client
 - Connect to phone hotspot via WiFi.h.
@@ -294,8 +318,8 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 - Handle reconnection on WiFi drop.
 
 ### Stream 3 — MCXC444 FreeRTOS Firmware
-- ✅ UART RX and TX, both interrupt-driven, using the checksummed frame protocol (`$GS`/`$EV` in, `$ACK`/`$NAK`/`$LDR` out).
-- ✅ LDR polling task with an interrupt-driven ADC, smoothing and hysteresis.
+- ✅ UART RX and TX, both interrupt-driven, using the checksummed frame protocol (`$GS`/`$EV` in, `$ACK`/`$NAK`/`$ENC` out).
+- ✅ Rotary encoder: PORTA pin-change ISR with a quadrature decoder (`encoder.c`, host unit-tested), reported as `$ENC`.
 - ✅ LED, buzzer (GPIO beep patterns) and servo (TPM0 lives gauge) tasks.
 - ✅ gameStateMutex, printMutex, txDoneSem, 4 queues; time-slicing and pre-emption on; unused kernel features off.
 - ✅ Host unit tests (`mcx/tests`) and the ESP32 simulator (`mcx/tools/esp32_sim.py`).
@@ -310,7 +334,7 @@ py -m venv .venv && .venv\Scripts\python -m pip install pyserial
 ### Stream 5 — Browser Flight Game
 - Three.js scene: sky, terrain, airplane model.
 - WebSocket client connects to cloud relay.
-- Map persistent sensor data to pitch/roll/yaw, camera orbit, fire, and LDR stealth; retain keyboard throttle.
+- Map persistent sensor data to pitch/roll/yaw, camera orbit, fire, and encoder throttle; keep keyboard throttle as fallback.
 - Send 400 ms game-state heartbeats and START/HIT/BONUS/OVER events back.
 - Host on GitHub Pages or Netlify.
 
@@ -334,8 +358,9 @@ CG2271/
 │   ├── source/                ← copy into the MCUXpresso project's source/
 │   │   ├── cg2271project_v1.c ← FreeRTOS firmware (tasks, ISRs, drivers)
 │   │   ├── protocol.c/.h      ← UART frame protocol (hardware-independent)
+│   │   ├── encoder.c/.h       ← rotary encoder decoder (hardware-independent)
 │   ├── FreeRTOSConfig_Gen.h   ← kernel config (time-slicing etc.)
-│   ├── tests/test_protocol.c  ← host unit tests
+│   ├── tests/                 ← host unit tests (test_protocol.c, test_encoder.c)
 │   ├── tools/esp32_sim.py     ← ESP32 simulator for standalone testing
 │   └── extras/                ← reference manual, schematic, lab templates
 ├── esp32/
@@ -343,7 +368,7 @@ CG2271/
 │   │   ├── esp32_flight.ino   ← Arduino sketch
 │   │   ├── TiltController.h   ← MPU sampling, calibration, filtering
 │   │   ├── ButtonEvents.h     ← debounced press counter
-│   │   └── McxLink.h          ← UART framing, retries, LDR parser
+│   │   └── McxLink.h          ← UART framing, retries, $ENC parser
 │   └── tests/                ← host sensor/button/UART tests
 ├── relay/
 │   ├── server.js              ← WebSocket relay

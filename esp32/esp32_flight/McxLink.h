@@ -103,13 +103,12 @@ class McxLink {
       }
       return true;
     }
-    unsigned long raw, dark;
-    if (count != 4 || strcmp(fields[0], "LDR") ||
-        !number(fields[2], 4095, raw) || !number(fields[3], 1, dark)) return false;
-    ldrRaw = static_cast<unsigned>(raw);
-    ldrDark = dark != 0;
-    ldrAt = now;
-    hasLdr = true;
+    // MCX rotary encoder throttle: $ENC,<seq>,<level 0-100>
+    unsigned long level;
+    if (count != 3 || strcmp(fields[0], "ENC") || !number(fields[2], 100, level)) return false;
+    encLevel = static_cast<unsigned>(level);
+    encAt = now;
+    hasEnc = true;
     return true;
   }
 
@@ -119,9 +118,9 @@ class McxLink {
     return n > 0 && static_cast<size_t>(n) < capacity;
   }
 
-  unsigned ldrRaw = 0;
-  bool ldrDark = false, hasLdr = false;
-  uint32_t ldrAt = 0, failedFrames = 0, droppedEvents = 0;
+  unsigned encLevel = 0;
+  bool hasEnc = false;
+  uint32_t encAt = 0, failedFrames = 0, droppedEvents = 0;
 
  private:
   static uint8_t checksum(const char *s, size_t n) {

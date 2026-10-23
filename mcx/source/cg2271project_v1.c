@@ -2,30 +2,29 @@
  * CG2271 Assignment 4 — MCXC444 FreeRTOS firmware (stream 3)
  *
  * Receives game state / events from the ESP32 over UART2, drives three
- * actuators from them, polls a light sensor and reports it back.
+ * actuators from them, reads a rotary encoder (throttle) and reports it back.
  *
  * Hardware (pins checked against MCXC444 RM ch.10 + FRDM schematic):
- *   UART2 TX   PTE22  ALT4        -> ESP32 RX      9600 8N1
- *   UART2 RX   PTE23  ALT4        <- ESP32 TX
- *   Red LED    PTE31  GPIO        onboard, active-LOW
- *   Servo      PTA5   ALT3        TPM0_CH2, 50 Hz          (header D5)
- *   Buzzer     PTD4   GPIO        active, active-HIGH      (header D10)
- *   LDR        PTB0   ALT0        ADC0_SE8                 (header A0)
- *              wiring: 3V3 - LDR - A0 - 10k - GND  (bright = high reading)
- *              PTB0 also carries the MCU-Link I2C SCL; if readings are noisy
- *              move the LDR to PTB2 / A2 (LDR_PIN 2U, LDR_ADC_CH 12U).
+ *   UART2 TX     PTE22  ALT4      -> ESP32 RX      9600 8N1
+ *   UART2 RX     PTE23  ALT4      <- ESP32 TX
+ *   Red LED      PTE31  GPIO      onboard, active-LOW
+ *   Servo        PTA5   ALT3      TPM0_CH2, 50 Hz          (header D5)
+ *   Buzzer       PTD4   GPIO      active, active-HIGH      (header D10)
+ *   Encoder CLK  PTA12  GPIO      pull-up, IRQ either edge (header D3)
+ *   Encoder DT   PTA13  GPIO      pull-up, IRQ either edge (header D8)
+ *                module + -> 3V3, GND -> GND, SW unused
  *
- * Protocol: see protocol.h ($GS / $EV in, $ACK / $NAK / $LDR out).
+ * Protocol: see protocol.h ($GS / $EV in, $ACK / $NAK / $ENC out).
  *
  * RTOS design:
  *   ISRs (non-blocking, FromISR APIs only):
  *     UART2_FLEXIO_IRQHandler  RX: frame lines -> rxQueue
  *                              TX: send txBuf char-by-char -> give txDoneSem
- *     ADC0_IRQHandler          conversion done -> notify ldrTask
+ *     PORTA_IRQHandler         encoder pin change -> decode -> notify encoderTask
  *   Tasks:
  *     commRxTask   pri 3   parse frames, update GameState, dispatch, ACK/NAK
  *     commTxTask   pri 2   sole owner of UART TX (txQueue -> ISR)
- *     ldrTask      pri 2   polled LDR every 100 ms, report to ESP32
+ *     encoderTask  pri 2   report throttle level to ESP32 on change + 500 ms
  *     ledTask      pri 1   LED patterns           } time-sliced with
  *     buzzerTask   pri 1   beep patterns          } each other
  *     servoTask    pri 1   lives gauge            }
@@ -33,7 +32,8 @@
  *     Queues   rxQueue, txQueue, ledQueue, buzzerQueue
  *     Mutex    gameStateMutex (GameState), printMutex (debug console)
  *     Binary semaphore  txDoneSem (ISR -> commTxTask)
- *     Task notification ADC ISR -> ldrTask
+ *     Task notification PORTA ISR -> encoderTask
+ *     Critical section  encoder state shared by PORTA ISR and encoderTask
  */
 
 #include <stdbool.h>
@@ -51,6 +51,7 @@
 #include "queue.h"
 #include "semphr.h"
 
+#include "encoder.h"
 #include "protocol.h"
 
 /* ===================================================================
@@ -60,15 +61,17 @@
 #define UART_TX_PTE22        22U
 #define UART_RX_PTE23        23U
 #define UART2_INT_PRIO       1U     /* 0 = highest on CM0+ (2 prio bits) */
-#define ADC0_INT_PRIO        2U
+#define PORTA_INT_PRIO       2U
 
 #define RED_PIN              31U    /* PTE31 onboard active-LOW red LED  */
+#define HAS_SERVO             0     /* set to 1 once the SG90 is wired to PTA5 */
 #define SERVO_PIN             5U    /* PTA5  TPM0_CH2                    */
 #define SERVO_CH              2U
 #define BUZZER_PIN            4U    /* PTD4  GPIO, active buzzer         */
 #define BUZZER_ACTIVE_LOW     0     /* set to 1 if LOW makes it beep     */
-#define LDR_PIN               0U    /* PTB0  ADC0_SE8                    */
-#define LDR_ADC_CH            8U
+#define ENC_CLK_PIN          12U    /* PTA12 GPIO, encoder CLK (D3)      */
+#define ENC_DT_PIN           13U    /* PTA13 GPIO, encoder DT  (D8)      */
+#define ENC_REVERSE           false /* true if turning right lowers it   */
 
 /* Servo TPM0 clock: IRC48M (TPMSRC = 1) / 128 = 375 kHz,
  * MOD 7499 -> 50 Hz, 1 count = 2.67 us. */
@@ -87,11 +90,7 @@
 
 #define LINK_TIMEOUT_MS    2000U    /* no valid frame for this long -> link lost */
 
-#define LDR_PERIOD_MS       100U
-#define LDR_REPORT_EVERY      2U    /* send $LDR every 2nd sample = 200 ms */
-#define LDR_AVG_LEN           4U
-#define LDR_DARK_BELOW     1200U    /* hysteresis thresholds (calibrate!)   */
-#define LDR_LIGHT_ABOVE    1600U
+#define ENC_HEARTBEAT_MS    500U    /* resend $ENC at least this often       */
 
 #define LED_TICK_MS          50U
 #define LED_FLASH_MS        100U
@@ -126,7 +125,7 @@ static QueueHandle_t      buzzerQueue;     /* commRxTask -> buzzerTask    */
 static SemaphoreHandle_t  gameStateMutex;  /* protects gameState          */
 static SemaphoreHandle_t  printMutex;      /* protects the debug console  */
 static SemaphoreHandle_t  txDoneSem;       /* UART ISR   -> commTxTask    */
-static TaskHandle_t       ldrTaskHandle;   /* ADC ISR notifies this task  */
+static TaskHandle_t       encoderTaskHandle; /* PORTA ISR notifies this task */
 
 static GameState gameState = { 0, 0, MODE_IDLE, false };
 
@@ -134,7 +133,9 @@ static GameState gameState = { 0, 0, MODE_IDLE, false };
  * ISR only while TIE is on, so the txDoneSem handshake protects it. */
 static char              txBuf[TX_FRAME_LEN];
 static volatile uint32_t txIdx;
-static volatile uint16_t ldrRaw;
+/* Encoder decoder state: written by PORTA ISR, read by encoderTask in a
+ * critical section. */
+static enc_t             encoder;
 
 volatile uint32_t uartDroppedMessages = 0;
 volatile uint32_t txDroppedFrames = 0;
@@ -187,6 +188,7 @@ static inline void setBuzzer(bool on)
     else                               GPIOD->PCOR = 1UL << BUZZER_PIN;
 }
 
+#if HAS_SERVO
 /* ===================================================================
  * Low-level: Servo (TPM0 channel 2, edge-aligned PWM, 50 Hz)
  * =================================================================*/
@@ -215,32 +217,35 @@ static void setServoDeg(uint32_t deg)
     if (deg > 180U) deg = 180U;
     TPM0->CONTROLS[SERVO_CH].CnV = SERVO_MIN_CNV + deg * (SERVO_MAX_CNV - SERVO_MIN_CNV) / 180U;
 }
+#endif /* HAS_SERVO */
 
 /* ===================================================================
- * Low-level: ADC0 (12-bit, software trigger, completion interrupt)
+ * Low-level: rotary encoder (PTA12 CLK / PTA13 DT, pin-change interrupt)
  * =================================================================*/
-static void initADC(void)
+static inline uint8_t encoderPins(void)
 {
-    NVIC_DisableIRQ(ADC0_IRQn);
-    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
-    SIM->SCGC6 |= SIM_SCGC6_ADC0_MASK;
-    PORTB->PCR[LDR_PIN] = PORT_PCR_MUX(0U);       /* analog */
-
-    ADC0->CFG1 = ADC_CFG1_ADIV(2U)                /* bus 24 MHz / 4 = 6 MHz */
-               | ADC_CFG1_ADLSMP_MASK             /* long sample: high-Z divider */
-               | ADC_CFG1_MODE(1U);               /* 12-bit single-ended    */
-    ADC0->CFG2 = 0;
-    ADC0->SC2  = ADC_SC2_REFSEL(1U);              /* VALTH/VALTL = VDDA, software trigger */
-    ADC0->SC3  = ADC_SC3_AVGE_MASK | ADC_SC3_AVGS(1U);  /* hw average of 8, single shot */
-
-    NVIC_SetPriority(ADC0_IRQn, ADC0_INT_PRIO);
-    NVIC_ClearPendingIRQ(ADC0_IRQn);
-    NVIC_EnableIRQ(ADC0_IRQn);
+    uint32_t in = GPIOA->PDIR;
+    return (uint8_t)((((in >> ENC_CLK_PIN) & 1U) << 1) | ((in >> ENC_DT_PIN) & 1U));
 }
 
-static inline void startADC(uint32_t channel)
+static void initEncoder(void)
 {
-    ADC0->SC1[0] = ADC_SC1_AIEN_MASK | ADC_SC1_ADCH(channel);
+    NVIC_DisableIRQ(PORTA_IRQn);
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK;
+
+    /* GPIO, pull-up (module outputs are open/pulled to 3V3), IRQ either edge. */
+    const uint32_t pcr = PORT_PCR_MUX(1U) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK
+                       | PORT_PCR_IRQC(0xBU);
+    PORTA->PCR[ENC_CLK_PIN] = pcr | PORT_PCR_ISF_MASK;
+    PORTA->PCR[ENC_DT_PIN]  = pcr | PORT_PCR_ISF_MASK;
+    GPIOA->PDDR &= ~((1UL << ENC_CLK_PIN) | (1UL << ENC_DT_PIN));
+
+    encoder_init(&encoder, encoderPins(), ENC_REVERSE);   /* latch idle state */
+
+    PORTA->ISFR = (1UL << ENC_CLK_PIN) | (1UL << ENC_DT_PIN);
+    NVIC_SetPriority(PORTA_IRQn, PORTA_INT_PRIO);
+    NVIC_ClearPendingIRQ(PORTA_IRQn);
+    NVIC_EnableIRQ(PORTA_IRQn);
 }
 
 /* ===================================================================
@@ -339,13 +344,15 @@ void UART2_FLEXIO_IRQHandler(void)
     portYIELD_FROM_ISR(hpw);
 }
 
-void ADC0_IRQHandler(void)
+void PORTA_IRQHandler(void)
 {
     BaseType_t hpw = pdFALSE;
+    const uint32_t mask = (1UL << ENC_CLK_PIN) | (1UL << ENC_DT_PIN);
 
-    if (ADC0->SC1[0] & ADC_SC1_COCO_MASK) {
-        ldrRaw = (uint16_t)ADC0->R[0];             /* reading R clears COCO */
-        vTaskNotifyGiveFromISR(ldrTaskHandle, &hpw);
+    if (PORTA->ISFR & mask) {
+        PORTA->ISFR = mask;                         /* write-1-to-clear */
+        if (encoder_update(&encoder, encoderPins()))
+            vTaskNotifyGiveFromISR(encoderTaskHandle, &hpw);
     }
     portYIELD_FROM_ISR(hpw);
 }
@@ -474,54 +481,33 @@ static void commTxTask(void *p)
 }
 
 /* ===================================================================
- * TASK: ldrTask (priority 2)
- * Polls the LDR every LDR_PERIOD_MS: starts a conversion and sleeps until
- * the ADC ISR notifies it. Smooths the value, applies hysteresis, and
- * reports to the ESP32 periodically and immediately on a dark/light change.
+ * TASK: encoderTask (priority 2)
+ * Interrupt-driven sensor: the PORTA ISR decodes every pin change and
+ * notifies this task when the throttle level moves. The task reports the
+ * level to the ESP32 immediately on change, and every ENC_HEARTBEAT_MS
+ * otherwise so the ESP32 can tell the reading is still fresh.
  * =================================================================*/
-static void ldrTask(void *p)
+static void encoderTask(void *p)
 {
     (void)p;
-    uint16_t hist[LDR_AVG_LEN] = { 0 };
-    uint32_t histIdx = 0, sinceReport = 0;
-    bool primed = false, dark = false;
     uint16_t seq = 0;
+    int lastLevel = -1;
     TxFrame f;
-    TickType_t lastWake = xTaskGetTickCount();
 
     while (1) {
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(LDR_PERIOD_MS));
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ENC_HEARTBEAT_MS));
 
-        (void)ulTaskNotifyTake(pdTRUE, 0);              /* drop any stale notify */
-        startADC(LDR_ADC_CH);
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10)) == 0U) {
-            LOG("LDR: ADC timeout\r\n");
-            continue;
-        }
-        uint16_t raw = ldrRaw;
+        taskENTER_CRITICAL();                  /* shared with PORTA ISR */
+        int level = encoder.level;
+        uint32_t skipped = encoder.skipped;
+        taskEXIT_CRITICAL();
 
-        if (!primed) {                                   /* fill on first sample */
-            for (uint32_t i = 0; i < LDR_AVG_LEN; i++) hist[i] = raw;
-            dark = raw < LDR_DARK_BELOW;
-            primed = true;
-        }
-        hist[histIdx] = raw;
-        histIdx = (histIdx + 1U) % LDR_AVG_LEN;
+        proto_build(f.text, sizeof f.text, "ENC,%u,%u", (unsigned)seq++, (unsigned)level);
+        queueFrame(&f);
 
-        uint32_t sum = 0;
-        for (uint32_t i = 0; i < LDR_AVG_LEN; i++) sum += hist[i];
-        uint16_t avg = (uint16_t)(sum / LDR_AVG_LEN);
-
-        bool changed = false;
-        if (!dark && avg < LDR_DARK_BELOW)        { dark = true;  changed = true; }
-        else if (dark && avg > LDR_LIGHT_ABOVE)   { dark = false; changed = true; }
-
-        if (changed || ++sinceReport >= LDR_REPORT_EVERY) {
-            sinceReport = 0;
-            proto_build(f.text, sizeof f.text, "LDR,%u,%u,%u",
-                        (unsigned)seq++, (unsigned)avg, dark ? 1U : 0U);
-            queueFrame(&f);
-            if (changed) LOG("LDR: %s (avg %u)\r\n", dark ? "dark" : "light", (unsigned)avg);
+        if (level != lastLevel) {
+            LOG("ENC: throttle %d%% (skipped %lu)\r\n", level, (unsigned long)skipped);
+            lastLevel = level;
         }
     }
 }
@@ -601,6 +587,7 @@ static void buzzerTask(void *p)
     }
 }
 
+#if HAS_SERVO
 /* ===================================================================
  * TASK: servoTask (priority 1)
  * Lives gauge: 0 lives = 0 deg, GAUGE_MAX_LIVES = 180 deg, slewed for a
@@ -633,6 +620,7 @@ static void servoTask(void *p)
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SERVO_PERIOD_MS));
     }
 }
+#endif /* HAS_SERVO */
 
 /* ===================================================================
  * FreeRTOS hooks: fail loudly (solid red LED) instead of corrupting memory
@@ -672,7 +660,9 @@ int main(void)
     /* Hardware init (UART2 is deferred to commRxTask). */
     initLED();
     initBuzzer();
+#if HAS_SERVO
     initServo();
+#endif
 
     /* ---- Create FreeRTOS objects ---- */
     rxQueue        = xQueueCreate(RX_QUEUE_LEN, sizeof(TMessage));
@@ -692,28 +682,30 @@ int main(void)
     /* ---- Create tasks ----
      *  commRxTask  pri 3  highest: never miss / delay incoming frames
      *  commTxTask  pri 2  replies go out promptly
-     *  ldrTask     pri 2  periodic sensor sampling
+     *  encoderTask pri 2  sensor reports
      *  led/buzzer/servo pri 1  actuators, time-sliced
      */
     BaseType_t ok = pdPASS;
-    ok &= xTaskCreate(commRxTask, "commRx", configMINIMAL_STACK_SIZE + 200, NULL, 3, NULL);
-    ok &= xTaskCreate(commTxTask, "commTx", configMINIMAL_STACK_SIZE + 80,  NULL, 2, NULL);
-    ok &= xTaskCreate(ldrTask,    "ldr",    configMINIMAL_STACK_SIZE + 200, NULL, 2, &ldrTaskHandle);
+    ok &= xTaskCreate(commRxTask,  "commRx",  configMINIMAL_STACK_SIZE + 200, NULL, 3, NULL);
+    ok &= xTaskCreate(commTxTask,  "commTx",  configMINIMAL_STACK_SIZE + 80,  NULL, 2, NULL);
+    ok &= xTaskCreate(encoderTask, "encoder", configMINIMAL_STACK_SIZE + 200, NULL, 2, &encoderTaskHandle);
     ok &= xTaskCreate(ledTask,    "led",    configMINIMAL_STACK_SIZE + 40,  NULL, 1, NULL);
     ok &= xTaskCreate(buzzerTask, "buzzer", configMINIMAL_STACK_SIZE + 40,  NULL, 1, NULL);
+#if HAS_SERVO
     ok &= xTaskCreate(servoTask,  "servo",  configMINIMAL_STACK_SIZE + 40,  NULL, 1, NULL);
+#endif
 
     if (ok != pdPASS) {
         PRINTF("ERROR: task allocation failed\r\n");
         fatalError();
     }
 
-    /* ADC interrupt needs ldrTaskHandle, so enable it after task creation. */
-    initADC();
+    /* The PORTA ISR needs encoderTaskHandle, so enable it after task creation. */
+    initEncoder();
 
     PRINTF("=== CG2271 A4 MCXC444 controller ===\r\n");
-    PRINTF("UART2 %u baud PTE22/23 | LED PTE31 | servo PTA5 | buzzer PTD4 | LDR PTB0\r\n",
-           BAUD_RATE);
+    PRINTF("UART2 %u baud PTE22/23 | LED PTE31 | servo PTA5%s | buzzer PTD4 | encoder PTA12/13\r\n",
+           BAUD_RATE, HAS_SERVO ? "" : " (disabled)");
 
     vTaskStartScheduler();
 
