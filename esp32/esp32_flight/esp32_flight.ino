@@ -9,8 +9,9 @@
  *   MPU-6050 (I2C)  → pitch, roll, yaw   (flight control)
  *   Joystick (ADC)  → camera X / Y       (camera orbit)
  *   Push button     → fire               (GPIO interrupt)
+ * Rotary encoder (throttle) is on the MCXC444; it arrives here as $ENC.
  *
- * MCXC444 sends: $LDR / $ACK / $NAK (see mcx/source/protocol.h).
+ * MCXC444 sends: $ENC / $ACK / $NAK (see mcx/source/protocol.h).
  * We send: $GS state heartbeats and $EV one-shot game events.
  *
  * UART wiring identical to Assignment 3:
@@ -37,7 +38,6 @@
 #include "McxLink.h"
 #include "ButtonEvents.h"
 #include "TiltController.h"
-#include "EncoderThrottle.h"
 #include "FireHold.h"
 
 // Original accelerometer convention: +X -> +pitch, +Y -> +roll.
@@ -58,11 +58,9 @@ TiltController tilt(originalDirections());
  * ════════════════════════════════════════════ */
 #define UART_TX_PIN   1    // Serial1 TX → MCX RX
 #define UART_RX_PIN   2    // Serial1 RX ← MCX TX
-#define USE_JOYSTICK  0    // 0: joystick replaced by the encoder (they clash on GPIO5)
+#define USE_JOYSTICK  1    // encoder moved to the MCXC444, so GPIO5 is the joystick's again
 #define JOY_X_PIN     3    // Joystick X axis (ADC)
-#define JOY_Y_PIN     5    // Joystick Y axis (ADC); same pin as ENC_DT_PIN
-#define ENC_CLK_PIN   6    // Rotary encoder CLK (module + to 3.3 V)
-#define ENC_DT_PIN    5    // Rotary encoder DT
+#define JOY_Y_PIN     5    // Joystick Y axis (ADC)
 #define BTN_PIN       7    // Fire button (active LOW, internal pull-up)
 #define I2C_SDA_PIN   8    // MPU-6050 SDA
 #define I2C_SCL_PIN   9    // MPU-6050 SCL
@@ -83,7 +81,7 @@ const char* WS_PATH    = "/";
 #define SEND_INTERVAL_MS    50     // 20 Hz sensor updates to game
 #define JOY_DEADZONE        80     // ADC units from center
 #define CLOUD_STALE_MS      1500
-#define LDR_STALE_MS        1000
+#define ENC_STALE_MS        1500   // MCX sends $ENC at least every 500 ms
 
 /* ════════════════════════════════════════════
  *  GLOBAL STATE
@@ -99,9 +97,7 @@ ButtonEvents button;
 portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t fireSession = 0, lastSentFireCount = 0;
 
-// Encoder throttle (updated in the pin-change ISR) and debounced held-fire level.
-EncoderThrottle encoder;
-portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+// Debounced held-fire level. (Throttle comes from the MCX encoder via $ENC.)
 FireHold fireHold;
 int lastPrintedThrottle = -1;
 bool lastPrintedHeld = false;
@@ -159,23 +155,13 @@ static uint32_t buttonCount() {
 }
 
 /* ════════════════════════════════════════════
- *  ROTARY ENCODER (interrupt on both pins)
+ *  THROTTLE (rotary encoder on the MCXC444, received as $ENC)
  * ════════════════════════════════════════════ */
-static uint8_t IRAM_ATTR encoderPins() {
-  return (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
-}
-
-void IRAM_ATTR encoderISR() {
-  portENTER_CRITICAL_ISR(&encoderMux);
-  encoder.update(encoderPins());
-  portEXIT_CRITICAL_ISR(&encoderMux);
-}
-
-static int throttleLevel() {
-  portENTER_CRITICAL(&encoderMux);
-  const int level = encoder.level();
-  portEXIT_CRITICAL(&encoderMux);
-  return level;
+// 0..100 while the MCX reading is fresh; -1 otherwise, which the game treats
+// as "no controller throttle" and falls back to Shift/Ctrl.
+static int throttleLevel(uint32_t now) {
+  if (!mcx.hasEnc || uint32_t(now - mcx.encAt) > ENC_STALE_MS) return -1;
+  return static_cast<int>(mcx.encLevel);
 }
 
 /* ════════════════════════════════════════════
@@ -262,20 +248,17 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint32_t presses,
                            int throttle, bool fireHeld) {
   if (!wsConnected) return false;
-  const bool ldrValid = mcx.hasLdr && uint32_t(millis() - mcx.ldrAt) <= LDR_STALE_MS;
   char json[448];
   const int len = snprintf(json, sizeof(json),
     "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
     "\"tiltValid\":%s,\"joyX\":%.3f,\"joyY\":%.3f,\"fire\":%s,"
     "\"fireSession\":%lu,\"fireCount\":%lu,\"firePending\":%lu,"
-    "\"fireHeld\":%s,\"throttle\":%d,"
-    "\"ldrValid\":%s,\"ldrRaw\":%u,\"dark\":%s}",
+    "\"fireHeld\":%s,\"throttle\":%d}",
     reading.pitch, reading.roll, reading.yaw, reading.valid ? "true" : "false", jx, jy,
     presses != lastSentFireCount ? "true" : "false",
     static_cast<unsigned long>(fireSession), static_cast<unsigned long>(presses),
     static_cast<unsigned long>(uint32_t(presses - lastSentFireCount)),
-    fireHeld ? "true" : "false", throttle,
-    ldrValid ? "true" : "false", mcx.ldrRaw, ldrValid && mcx.ldrDark ? "true" : "false");
+    fireHeld ? "true" : "false", throttle);
   return len > 0 && len < static_cast<int>(sizeof(json)) && webSocket.sendTXT(json, len);
 }
 
@@ -320,13 +303,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_PIN), buttonISR, FALLING);
   Serial.printf("[BTN] GPIO%d, interrupt on FALLING\n", BTN_PIN);
 
-  // Rotary encoder: latch the idle state first, then interrupt on every change.
-  pinMode(ENC_CLK_PIN, INPUT_PULLUP);
-  pinMode(ENC_DT_PIN, INPUT_PULLUP);
-  encoder.begin(encoderPins());
-  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
-  Serial.printf("[ENC] CLK=GPIO%d DT=GPIO%d, throttle %d%%\n", ENC_CLK_PIN, ENC_DT_PIN, throttleLevel());
+  Serial.println("[ENC] throttle comes from the MCXC444 encoder ($ENC over UART)");
 
 #if USE_JOYSTICK
   // Joystick calibration (read center position at rest)
@@ -385,9 +362,10 @@ void loop() {
     readJoystick(jx, jy);
 #endif
     const uint32_t presses = buttonCount();
-    const int throttle = throttleLevel();
+    const int throttle = throttleLevel(now);
     if (throttle != lastPrintedThrottle) {
-      Serial.printf("[ENC] throttle %d%%\n", throttle);
+      if (throttle < 0) Serial.println("[ENC] no fresh $ENC from MCX (keyboard throttle)");
+      else              Serial.printf("[ENC] throttle %d%%\n", throttle);
       lastPrintedThrottle = throttle;
     }
     if (fireHold.held() != lastPrintedHeld || presses != lastPrintedPresses) {

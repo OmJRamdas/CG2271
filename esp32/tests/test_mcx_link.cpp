@@ -60,17 +60,29 @@ int main() {
   receive(link, "ACK,1");
   assert(parse(link.nextFrame(403)).type == MSG_GAME_STATE);  // Heartbeat.
   receive(link, "ACK,2");
-  receive(link, "LDR,10,1100,1", 500);
-  assert(link.hasLdr && link.ldrRaw == 1100 && link.ldrDark && link.ldrAt == 500);
-  assert(!link.receive("$LDR,10,1100,1*00", 501));
+  receive(link, "ENC,10,65", 500);
+  assert(link.hasEnc && link.encLevel == 65 && link.encAt == 500);
+  assert(!link.receive("$ENC,10,65*00", 501));  // Bad checksum.
   char bad[80];
-  McxLink::buildFrame(bad, sizeof(bad), "LDR,1,999999999999999999999,1");
+  McxLink::buildFrame(bad, sizeof(bad), "ENC,1,999999999999999999999");
   bad[strlen(bad) - 1] = '\0';
   assert(!link.receive(bad, 502));
-  McxLink::buildFrame(bad, sizeof(bad), "LDR,1,4096,1");
+  McxLink::buildFrame(bad, sizeof(bad), "ENC,1,101");  // Out of range.
   bad[strlen(bad) - 1] = '\0';
   assert(!link.receive(bad, 502));
-  assert(link.ldrRaw == 1100);
+  McxLink::buildFrame(bad, sizeof(bad), "ENC,1,50,1");  // Old/extra field.
+  bad[strlen(bad) - 1] = '\0';
+  assert(!link.receive(bad, 502));
+  McxLink::buildFrame(bad, sizeof(bad), "LDR,1,1100,1");  // LDR no longer accepted.
+  bad[strlen(bad) - 1] = '\0';
+  assert(!link.receive(bad, 502));
+  assert(link.encLevel == 65 && link.encAt == 500);
+
+  // The real MCX builder's $ENC frame is accepted.
+  char mcxFrame[32];
+  assert(proto_build(mcxFrame, sizeof(mcxFrame), "ENC,%u,%u", 11U, 0U) > 0);
+  mcxFrame[strlen(mcxFrame) - 1] = '\0';
+  assert(link.receive(mcxFrame, 600) && link.encLevel == 0 && link.encAt == 600);
   for (unsigned i = 0; i < 16; ++i) assert(link.queueEvent("BONUS"));
   assert(!link.queueEvent("HIT") && link.droppedEvents == 1);
   link.suspend();
@@ -97,5 +109,5 @@ int main() {
     snprintf(ack, sizeof(ack), "ACK,%u", msg.seq);
     receive(wrap, ack);
   }
-  puts("ESP32/MCX interoperability, retry, duplicate, LDR and sequence wrap tests passed");
+  puts("ESP32/MCX interoperability, retry, duplicate, ENC and sequence wrap tests passed");
 }

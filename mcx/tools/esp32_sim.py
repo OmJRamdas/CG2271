@@ -2,7 +2,7 @@
 ESP32 simulator for standalone MCXC444 testing.
 
 Plays the ESP32's side of the UART protocol (see mcx/source/protocol.h):
-sends $GS / $EV frames and checks the MCXC444's $ACK / $NAK / $LDR replies.
+sends $GS / $EV frames and checks the MCXC444's $ACK / $NAK / $ENC replies.
 
 Wiring: USB-UART adapter TX -> PTE23, RX -> PTE22, GND -> GND (3.3 V levels!).
 (Or flash the ESP32 with a Serial<->Serial1 passthrough sketch.)
@@ -68,7 +68,8 @@ class Sim:
         self.seq = 0
         self.sent = 0
         self.pending = {}            # seq -> (body, expect "ACK"/"NAK")
-        self.stats = {"ACK": 0, "NAK": 0, "LDR": 0, "unexpected": 0, "bad": 0}
+        self.stats = {"ACK": 0, "NAK": 0, "ENC": 0, "unexpected": 0, "bad": 0}
+        self.last_enc = None
         self.lock = threading.Lock()
         self.running = True
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -113,10 +114,12 @@ class Sim:
             self.stats["bad"] += 1
             print(f"<< {line!r}  !! {e}")
             return
-        if kind == "LDR":
-            self.stats["LDR"] += 1
-            _, raw, dark = fields
-            print(f"<< LDR raw={raw:>4} dark={dark}")
+        if kind == "ENC":
+            self.stats["ENC"] += 1
+            _, level = fields
+            if level != self.last_enc:  # heartbeats repeat the level; print changes only
+                print(f"<< ENC throttle={level:>3}%")
+                self.last_enc = level
             return
         if kind in ("ACK", "NAK"):
             seq = int(fields[0])

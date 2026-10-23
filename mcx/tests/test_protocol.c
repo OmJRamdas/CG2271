@@ -43,7 +43,8 @@ static void test_build(void)
     CHECK(proto_build(buf, sizeof buf, "ACK,%u", 12U) == 11);
     CHECK(strcmp(buf, "$ACK,12*66\n") == 0);
 
-    CHECK(proto_build(buf, sizeof buf, "LDR,%u,%u,%u", 7U, 4095U, 1U) > 0);
+    CHECK(proto_build(buf, sizeof buf, "ENC,%u,%u", 65535U, 100U) > 0);
+    CHECK(strncmp(buf, "$ENC,65535,100*", 15) == 0);
     CHECK(buf[0] == '$' && buf[strlen(buf) - 1] == '\n');
 
     /* Exact fit: "$ACK,12*66\n" is 11 chars + NUL = 12 bytes. */

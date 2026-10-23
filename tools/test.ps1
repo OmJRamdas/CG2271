@@ -9,6 +9,10 @@ try {
     if ($LASTEXITCODE) { throw 'Protocol compilation failed' }
     & ./.build/test_protocol.exe
     if ($LASTEXITCODE) { throw 'Protocol tests failed' }
+    gcc -std=c11 -Wall -Wextra -Werror -I mcx/source mcx/tests/test_encoder.c mcx/source/encoder.c -o .build/test_encoder.exe
+    if ($LASTEXITCODE) { throw 'Encoder compilation failed' }
+    & ./.build/test_encoder.exe
+    if ($LASTEXITCODE) { throw 'Encoder tests failed' }
     gcc -std=c11 -Wall -Wextra -Werror -I mcx/source -c mcx/source/protocol.c -o .build/protocol.o
     if ($LASTEXITCODE) { throw 'Protocol object compilation failed' }
     g++ -std=c++11 -Wall -Wextra -Werror -I esp32/esp32_flight -I mcx/source esp32/tests/test_mcx_link.cpp .build/protocol.o -o .build/test_mcx_link.exe

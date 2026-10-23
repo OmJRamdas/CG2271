@@ -12,7 +12,7 @@
  * MCXC444 -> ESP32
  *     $ACK,<seq>*CK          valid frame <seq> received
  *     $NAK,<seq>*CK          invalid frame (bad checksum / format), seq 0 if unreadable
- *     $LDR,<seq>,<raw>,<dark>*CK   light sensor: raw 0..4095, dark 0/1
+ *     $ENC,<seq>,<level>*CK  rotary encoder throttle 0..100, on change + every 500 ms
  *
  * Pure C, no hardware or RTOS dependencies, so it can be unit-tested on a PC.
  */
