@@ -16,25 +16,34 @@ const player = { mesh: null };
 function initPlayer() {
   if (player.mesh) scene.remove(player.mesh);
   player.mesh = makeplane(0x2266cc, 0xffffff);
-  player.mesh.userData.navigationLights = [-1, 1].map(side => {
-    const color = side < 0 ? 0xff3333 : 0x33ff66;
-    const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 4),
-      new THREE.MeshBasicMaterial({ color }));
-    lamp.position.set(side * 3.7, 0.12, 0.15);
-    lamp.userData.normalColor = color;
-    player.mesh.add(lamp);
-    return lamp;
-  });
   player.mesh.position.set(0, C.START_ALT, 0);
+
+  // Gun barrels (visual) — center nose + left/right wing
+  const gunMat = new THREE.MeshPhongMaterial({ color: 0x444444, flatShading: true });
+  const gunGeo = new THREE.CylinderGeometry(0.06, 0.06, 1.0, 5);
+  gunGeo.rotateX(Math.PI / 2);
+
+  const gunC = new THREE.Mesh(gunGeo, gunMat);
+  gunC.position.set(0, -0.15, -2.6);
+  player.mesh.add(gunC);
+
+  const gunL = new THREE.Mesh(gunGeo, gunMat);
+  gunL.position.set(-2.8, -0.12, -0.3);
+  player.mesh.add(gunL);
+
+  const gunR = new THREE.Mesh(gunGeo, gunMat);
+  gunR.position.set(2.8, -0.12, -0.3);
+  player.mesh.add(gunR);
+
   scene.add(player.mesh);
 }
 
 /* ===== Player projectile ===== */
 class Projectile {
   constructor(pos, dir) {
-    const g = new THREE.CylinderGeometry(0.06, 0.06, 0.8, 4);
+    const g = new THREE.CylinderGeometry(0.18, 0.18, 1.4, 6);
     g.rotateX(Math.PI / 2);
-    this.mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xffdd44 }));
+    this.mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xff6600 }));
     this.mesh.position.copy(pos);
     this.dir = dir.clone().normalize();
     this.mesh.lookAt(pos.clone().add(this.dir));
@@ -44,6 +53,7 @@ class Projectile {
   }
   update() {
     this.mesh.position.addScaledVector(this.dir, C.PROJ_SPEED);
+    wrapPos(this.mesh.position);
     this.life++;
     if (this.life > C.PROJ_LIFE) this.alive = false;
   }
@@ -90,19 +100,22 @@ renderer.domElement.setAttribute('tabindex', '0');
 renderer.domElement.style.outline = 'none';
 renderer.domElement.addEventListener('click', () => renderer.domElement.focus());
 
-let mouseX = 0, mouseY = 0;
+// Mouse free-look: accumulated orbit via pointer lock (full 360°)
+let mouseOrbitH = 0;   // horizontal (radians, unbounded)
+let mouseOrbitV = 0;   // vertical   (radians, clamped)
+
 document.addEventListener('mousemove', e => {
-  mouseX = (e.clientX / innerWidth) * 2 - 1;
-  mouseY = -((e.clientY / innerHeight) * 2 - 1);
+  if (!S.running || S.over) return;
+  if (document.pointerLockElement) {
+    mouseOrbitH -= e.movementX * C.MOUSE_SENS;
+    mouseOrbitV = clamp(mouseOrbitV - e.movementY * C.MOUSE_SENS,
+                        -C.MOUSE_V_CLAMP, C.MOUSE_V_CLAMP);
+  }
 });
 
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
-  if (e.code === 'KeyI' && !e.repeat) {
-    showInputs = !showInputs;
-    document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
-  }
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -129,95 +142,12 @@ function readKeyboard() {
   if (keys['ShiftLeft'] || keys['ShiftRight']) S.tIn = 1;
   if (keys['ControlLeft'] || keys['ControlRight']) S.tIn = -1;
   if (keys['Space']) S.fire = true;
-  // Camera: mouse/trackpad; arrow keys override
+  // Camera: arrow keys give a temporary offset (snaps back to 0)
+  // Mouse orbit is handled separately via pointer lock
   if (keys['ArrowLeft']) S.camX = -1;
   else if (keys['ArrowRight']) S.camX = 1;
-  else S.camX = mouseX;
   if (keys['ArrowUp']) S.camY = 1;
   else if (keys['ArrowDown']) S.camY = -1;
-  else S.camY = mouseY;
-}
-
-/* ===== Controller input ===== */
-const CONTROLLER_STALE_MS = 300;
-const controller = {
-  at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
-  pendingFire: 0, fireSession: null, fireCount: 0,
-  ldrValid: false, dark: false, ldrRaw: 0,
-  fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
-};
-// Press I during a game to show what the hardware controller is sending.
-let showInputs = false;
-let lastSentState = null;
-
-function clearController() {
-  controller.at = -Infinity;
-  controller.pendingFire = 0;
-  controller.fireHeld = false;
-  controller.throttle = null;
-  controller.throttleApplied = null;
-  controller.tiltValid = false;
-  controller.ldrValid = false;
-  controller.dark = false;
-  S.stealth = false;
-  // Keep the last session/count so reconnects do not replay delivered presses.
-}
-
-function receiveSensor(d) {
-  const axes = ['pitch', 'roll', 'yaw', 'joyX', 'joyY'];
-  if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
-  controller.at = performance.now();
-  for (const key of axes) controller[key] = clamp(d[key], -1, 1);
-  controller.tiltValid = d.tiltValid !== false;
-  if (!controller.tiltValid) controller.pitch = controller.roll = controller.yaw = 0;
-  controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
-    d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
-  controller.dark = controller.ldrValid && d.dark;
-  controller.ldrRaw = controller.ldrValid ? d.ldrRaw : 0;
-  controller.fireHeld = d.fireHeld === true;
-  controller.throttle = Number.isFinite(d.throttle) && d.throttle >= 0 && d.throttle <= 100
-    ? d.throttle : null;
-
-  const uint32 = n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
-  let presses = 0;
-  if (uint32(d.fireSession) && uint32(d.fireCount)) {
-    if (controller.fireSession !== d.fireSession) {
-      controller.fireSession = d.fireSession;
-      controller.pendingFire = 0;
-      // A first packet only owns presses still pending at the ESP32, not its
-      // entire boot history. Subsequent counters recover missed sensor packets.
-      presses = uint32(d.firePending) ? d.firePending : (d.fire === true ? 1 : 0);
-      controller.fireCount = d.fireCount;
-    } else {
-      const delta = (d.fireCount - controller.fireCount) >>> 0;
-      if (delta < 0x80000000) {
-        presses = delta;
-        controller.fireCount = d.fireCount;
-      }
-    }
-  } else if (d.fire === true) presses = 1;  // Legacy boolean sender.
-  if (S.running) controller.pendingFire += presses;
-}
-
-function readInputs() {
-  readKeyboard();  // Original keyboard directions and held-space firing.
-  if (!ws || ws.readyState !== 1 || performance.now() - controller.at > CONTROLLER_STALE_MS) {
-    clearController();
-    return;
-  }
-  S.pIn = controller.pitch;
-  S.rIn = controller.roll;
-  S.yIn = controller.yaw;
-  S.camX = controller.joyX;
-  S.camY = controller.joyY;
-  S.stealth = controller.ldrValid && controller.dark;
-  // The encoder reports an absolute level (0..100). Apply it only when it changes,
-  // so Shift/Ctrl keep working between knob movements.
-  if (controller.throttle !== null && controller.throttle !== controller.throttleApplied) {
-    S.targetSpeed = C.MIN_SPD + (controller.throttle / 100) * (C.MAX_SPD - C.MIN_SPD);
-    controller.throttleApplied = controller.throttle;
-  }
-  S.fire = S.fire || controller.fireHeld || controller.pendingFire > 0;
 }
 
 /* ===== WebSocket ===== */
@@ -226,57 +156,39 @@ function toggleWS() {
   const url = document.getElementById('ws-url').value.trim();
   if (!url) return;
   try {
-    const socket = new WebSocket(url);
-    ws = socket;
-    clearController();
-    socket.onopen = () => {
-      if (ws !== socket) return;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
       document.getElementById('ws-dot').classList.add('on');
       document.getElementById('ws-btn').textContent = 'Disconnect';
-      socket.send(JSON.stringify({ type: 'identify', role: 'game' }));
-      sendGameState();
+      ws.send(JSON.stringify({ type: 'identify', role: 'game' }));
     };
-    socket.onclose = () => {
-      if (ws !== socket) return;
-      clearController();
+    ws.onclose = () => {
       document.getElementById('ws-dot').classList.remove('on');
       document.getElementById('ws-btn').textContent = 'Connect';
     };
-    socket.onerror = () => socket.close();
-    socket.onmessage = (ev) => {
-      if (ws !== socket) return;
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
-        if (d && d.type === 'sensor') receiveSensor(d);
+        if (d.type === 'sensor') {
+          if (d.pitch !== undefined) S.pIn = clamp(d.pitch, -1, 1);
+          if (d.roll  !== undefined) S.rIn = clamp(d.roll, -1, 1);
+          if (d.yaw   !== undefined) S.yIn = clamp(d.yaw, -1, 1);
+          if (d.joyX  !== undefined) S.camX = clamp(d.joyX, -1, 1);
+          if (d.joyY  !== undefined) S.camY = clamp(d.joyY, -1, 1);
+          if (d.fire) S.fire = true;
+          if (d.pot   !== undefined) S.potThrottle = clamp(d.pot, 0, 1);
+        }
       } catch (_) {}
     };
   } catch (_) {}
 }
 
-function sendGameState() {
-  if (ws && ws.readyState === 1) {
-    const state = {
-      type: 'game_state',
-      // Preserve the game's 100-point hull; expose three gauge segments to MCX.
-      lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
-      score: Math.floor(clamp(S.score, 0, 9999999)),
-      mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
-    };
-    lastSentState = state;
-    ws.send(JSON.stringify(state));
-  }
-}
-
 function sendEvent(event, value) {
-  if (!['HIT', 'START', 'OVER', 'BONUS'].includes(event)) return;
   if (ws && ws.readyState === 1) {
-    sendGameState();
     ws.send(JSON.stringify({ type: 'event', event, value }));
   }
 }
-
-// Runs on the start screen and after game over too, independently of rendering.
-setInterval(sendGameState, 400);
 
 /* ===== Player physics ===== */
 function updatePlayer() {
@@ -284,7 +196,12 @@ function updatePlayer() {
   S.cR = lerp(S.cR, S.rIn, C.CTRL_LERP);
   S.cY = lerp(S.cY, S.yIn, C.CTRL_LERP);
 
-  S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
+  // Throttle: pot overrides keyboard
+  if (S.potThrottle >= 0) {
+    S.targetSpeed = C.MIN_SPD + S.potThrottle * (C.MAX_SPD - C.MIN_SPD);
+  } else {
+    S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
+  }
   S.speed = lerp(S.speed, S.targetSpeed, 0.03);
 
   _qP.setFromAxisAngle(_axisX, S.cP * C.PITCH_SPD);
@@ -301,10 +218,56 @@ function updatePlayer() {
   _fwd.set(0, 0, -1).applyQuaternion(player.mesh.quaternion);
   player.mesh.position.addScaledVector(_fwd, S.speed);
 
+  // Circular wrap — snap camera so it doesn't lerp across the map
+  const _preX = player.mesh.position.x, _preZ = player.mesh.position.z;
+  wrapPos(player.mesh.position);
+  const wdx = player.mesh.position.x - _preX;
+  const wdz = player.mesh.position.z - _preZ;
+  if (Math.abs(wdx) > 1 || Math.abs(wdz) > 1) {
+    camera.position.x += wdx;
+    camera.position.z += wdz;
+  }
+
   // Ground collision
   if (player.mesh.position.y < C.GROUND_Y + 5) {
     player.mesh.position.y = C.GROUND_Y + 5;
     takeDamage(5);
+  }
+
+  // Ceiling — stall speed + tick damage + icing effect
+  if (player.mesh.position.y > C.CEILING) {
+    S.speed *= 0.1;
+    S.targetSpeed = C.MIN_SPD;
+    if (S.dmgCD <= 0) takeDamage(5);
+    document.getElementById('ceiling-warn').classList.add('show');
+    // Ice over the plane: tint all parts white-blue
+    player.mesh.children.forEach(c => {
+      if (c.material && !c.material._iced) {
+        c.material._origHex = c.material.color.getHex();
+        c.material._origOpacity = c.material.opacity;
+        c.material._iced = true;
+      }
+      if (c.material && c.material._iced) {
+        c.material.color.lerp(new THREE.Color(0xccddff), 0.08);
+        c.material.opacity = Math.max(c.material.opacity, 0.85);
+      }
+    });
+  } else {
+    document.getElementById('ceiling-warn').classList.remove('show');
+    // Thaw: restore original colors
+    player.mesh.children.forEach(c => {
+      if (c.material && c.material._iced) {
+        c.material.color.lerp(new THREE.Color(c.material._origHex), 0.05);
+        const cur = c.material.color.getHex();
+        const orig = c.material._origHex;
+        // Close enough — snap back
+        if (Math.abs(((cur >> 16) & 0xff) - ((orig >> 16) & 0xff)) < 4) {
+          c.material.color.setHex(orig);
+          c.material.opacity = c.material._origOpacity;
+          delete c.material._iced;
+        }
+      }
+    });
   }
 
   // Propeller
@@ -312,13 +275,28 @@ function updatePlayer() {
     player.mesh.userData.prop.rotation.z += 0.2 + S.speed * 0.15;
   }
 
-  // Firing
+  // Firing — three guns: center nose + left/right wing
   S.fireCD = Math.max(0, S.fireCD - 1);
   if (S.fire && S.fireCD === 0) {
-    const p = player.mesh.position.clone().addScaledVector(_fwd, 3.5);
-    projectiles.push(new Projectile(p, _fwd.clone()));
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(player.mesh.quaternion);
+
+    // Center gun (nose)
+    const pC = player.mesh.position.clone().addScaledVector(_fwd, 3.5);
+    projectiles.push(new Projectile(pC, _fwd.clone()));
+
+    // Left wing gun
+    const pL = player.mesh.position.clone()
+      .addScaledVector(right, -2.8)
+      .addScaledVector(_fwd, 1.0);
+    projectiles.push(new Projectile(pL, _fwd.clone()));
+
+    // Right wing gun
+    const pR = player.mesh.position.clone()
+      .addScaledVector(right, 2.8)
+      .addScaledVector(_fwd, 1.0);
+    projectiles.push(new Projectile(pR, _fwd.clone()));
+
     S.fireCD = C.FIRE_CD;
-    if (controller.pendingFire > 0) controller.pendingFire--;
   }
 }
 
@@ -327,17 +305,32 @@ const camTarget = new THREE.Vector3();
 const camPos    = new THREE.Vector3();
 
 function updateCamera() {
+  // Mouse orbit decays back to forward-facing
+  mouseOrbitH = lerp(mouseOrbitH, 0, 0.04);
+  mouseOrbitV = lerp(mouseOrbitV, 0, 0.04);
+
+  // Joystick / arrow keys: smooth temporary offset that snaps back to 0
   S.sCamX = lerp(S.sCamX, S.camX, C.CAM_ORBIT_LERP);
   S.sCamY = lerp(S.sCamY, S.camY, C.CAM_ORBIT_LERP);
 
+  // Total orbit = persistent mouse free-look + snap-back joystick offset
+  const orbitH = mouseOrbitH + S.sCamX * C.CAM_ORBIT_SPD;
+  const orbitV = mouseOrbitV + S.sCamY * 0.5;
+
   const offset = new THREE.Vector3(0, C.CAM_H, C.CAM_DIST);
-  offset.applyAxisAngle(_axisY, S.sCamX * C.CAM_ORBIT_SPD);
-  offset.applyAxisAngle(_axisX, -S.sCamY * 0.5);
+  offset.applyAxisAngle(_axisY, orbitH);
+  offset.applyAxisAngle(_axisX, -orbitV);
   offset.applyQuaternion(player.mesh.quaternion);
   camPos.copy(player.mesh.position).add(offset);
   camera.position.lerp(camPos, C.CAM_LERP);
 
-  const look = new THREE.Vector3(-S.sCamX * 15, S.sCamY * 8, -25);
+  // Look target: use orbit angles so camera looks where you orbit to
+  const lookDist = 25;
+  const look = new THREE.Vector3(
+    -Math.sin(orbitH) * lookDist,
+    Math.sin(orbitV) * 15,
+    -Math.cos(orbitH) * lookDist
+  );
   look.applyQuaternion(player.mesh.quaternion);
   camTarget.copy(player.mesh.position).add(look);
   camera.lookAt(camTarget);
@@ -405,7 +398,8 @@ function spawnWave(waveNum) {
   banner.style.opacity = '1';
   setTimeout(() => { banner.style.opacity = '0'; }, 2000);
 
-  if (waveNum > 1) sendEvent('BONUS', waveNum);
+  sendEvent('BOOST', 1);
+  setTimeout(() => sendEvent('BOOST', 0), 500);
 }
 
 function checkWaveComplete() {
@@ -414,7 +408,6 @@ function checkWaveComplete() {
     S.waveTransition = true;
     S.waveDelay = C.WAVE_DELAY;
     S.health = Math.min(100, S.health + 25);
-    sendGameState();
     addKillMsg('WAVE ' + S.wave + ' CLEARED!');
   }
 }
@@ -438,32 +431,6 @@ function addKillMsg(text) {
   setTimeout(() => el.remove(), 2200);
 }
 
-/* ===== Input debug overlay (toggle with I) ===== */
-function inputDebugText() {
-  const f = v => (v >= 0 ? '+' : '') + v.toFixed(2);
-  const age = performance.now() - controller.at;
-  let link;
-  if (!ws || ws.readyState !== 1) link = 'disconnected (click Connect)';
-  else if (!Number.isFinite(age) || age > CONTROLLER_STALE_MS) link = 'connected, no sensor data from ESP32';
-  else link = 'connected (' + age.toFixed(0) + ' ms ago)';
-  const live = ws && ws.readyState === 1 && age <= CONTROLLER_STALE_MS;
-  const lines = ['LINK  ' + link];
-  if (live) {
-    lines.push('TILT  ' + (controller.tiltValid
-      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) + ' yaw ' + f(controller.yaw)
-      : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
-    lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
-    lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
-    lines.push('THR   ' + (controller.throttle !== null
-      ? controller.throttle + ' %'
-      : 'none: no $ENC from MCX (keyboard Shift/Ctrl)'));
-  }
-  lines.push('MCX   sent: ' + (lastSentState
-    ? lastSentState.mode + '  lives ' + lastSentState.lives + '  score ' + lastSentState.score
-    : 'nothing yet'));
-  return lines.join('\n');
-}
-
 function updateHUD() {
   document.getElementById('score').textContent = S.score;
   document.getElementById('kills').textContent = S.kills + ' KILL' + (S.kills !== 1 ? 'S' : '');
@@ -479,38 +446,122 @@ function updateHUD() {
       : 'linear-gradient(90deg,#ef4444,#dc2626)';
   document.getElementById('speed-box').textContent = 'SPD: ' + (S.speed * 100).toFixed(0);
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
-  if (showInputs) document.getElementById('input-debug').textContent = inputDebugText();
+  document.getElementById('pos-box').textContent = 'POS: ' + Math.round(player.mesh.position.x) + ', ' + Math.round(player.mesh.position.z);
 
-  const stealth = S.stealth ? ' · STEALTH' : '';
-  document.getElementById('controls-help').textContent =
-    'WASD Pitch/Roll  Q/E Yaw  Arrows Camera  Shift/Ctrl Throttle  Space Fire' + stealth;
-  // Covering the LDR dims the aircraft's lights, without changing steering.
-  player.mesh.userData.navigationLights.forEach(lamp => {
-    lamp.material.color.setHex(lamp.userData.normalColor).multiplyScalar(S.stealth ? 0.15 : 1);
-  });
+  if (ws && ws.readyState === 1) {
+    const euler = new THREE.Euler().setFromQuaternion(player.mesh.quaternion, 'YXZ');
+    sendEvent('ROLL', Math.round(THREE.MathUtils.radToDeg(euler.z)));
+  }
+}
+
+/* ===== Minimap ===== */
+const mmCanvas = document.getElementById('minimap');
+const mm = mmCanvas.getContext('2d');
+const MM_R = 75;  // canvas is 150×150, radius 75
+const MM_SCALE = MM_R / C.WORLD;  // map units → minimap pixels
+
+function updateMinimap() {
+  mm.clearRect(0, 0, 150, 150);
+
+  const px = player.mesh.position.x;
+  const pz = player.mesh.position.z;
+
+  // Background circle
+  mm.save();
+  mm.beginPath();
+  mm.arc(MM_R, MM_R, MM_R - 1, 0, Math.PI * 2);
+  mm.clip();
+
+  // Player heading (yaw angle from quaternion)
+  const pFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(player.mesh.quaternion);
+  const heading = Math.atan2(pFwd.x, pFwd.z);
+
+  // Rotate map so player always faces up
+  mm.translate(MM_R, MM_R);
+  mm.rotate(-heading);
+
+  // Map boundary ring (circular world edge)
+  mm.strokeStyle = 'rgba(255,255,255,0.15)';
+  mm.lineWidth = 1;
+  const pDist = Math.sqrt(px * px + pz * pz);
+  const borderR = (C.WORLD - pDist) * MM_SCALE;
+  if (borderR > 0 && borderR < MM_R + 20) {
+    mm.beginPath();
+    mm.arc(0, 0, Math.min(borderR, MM_R + 10), 0, Math.PI * 2);
+    mm.stroke();
+  }
+
+  // Use wrappedTarget to find closest position of each enemy
+  const _mmTarget = new THREE.Vector3();
+  const _mmObs = new THREE.Vector3(px, 0, pz);
+
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    wrappedTarget(_mmObs, e.mesh.position, _mmTarget);
+    const dx = (_mmTarget.x - px) * MM_SCALE;
+    const dz = (_mmTarget.z - pz) * MM_SCALE;
+    if (dx * dx + dz * dz < (MM_R - 4) * (MM_R - 4)) {
+      mm.fillStyle = '#ff4444';
+      mm.beginPath();
+      mm.arc(dx, dz, 3, 0, Math.PI * 2);
+      mm.fill();
+    }
+  }
+
+  // Enemy projectiles (small red dots)
+  for (const ep of enemyProjectiles) {
+    if (!ep.alive) continue;
+    wrappedTarget(_mmObs, ep.mesh.position, _mmTarget);
+    const dx = (_mmTarget.x - px) * MM_SCALE;
+    const dz = (_mmTarget.z - pz) * MM_SCALE;
+    if (dx * dx + dz * dz < (MM_R - 4) * (MM_R - 4)) {
+      mm.fillStyle = 'rgba(255,68,68,0.5)';
+      mm.beginPath();
+      mm.arc(dx, dz, 1.5, 0, Math.PI * 2);
+      mm.fill();
+    }
+  }
+
+  mm.restore();
+
+  // Player triangle (always centered, pointing up)
+  mm.fillStyle = '#4ade80';
+  mm.beginPath();
+  mm.moveTo(MM_R, MM_R - 6);
+  mm.lineTo(MM_R - 4, MM_R + 4);
+  mm.lineTo(MM_R + 4, MM_R + 4);
+  mm.closePath();
+  mm.fill();
+
+  // Outer ring
+  mm.strokeStyle = 'rgba(255,255,255,0.3)';
+  mm.lineWidth = 2;
+  mm.beginPath();
+  mm.arc(MM_R, MM_R, MM_R - 1, 0, Math.PI * 2);
+  mm.stroke();
 }
 
 /* ===== Game over / restart ===== */
 function gameOver() {
   S.over = true;
   S.running = false;
+  if (document.pointerLockElement) document.exitPointerLock();
   document.getElementById('final-score').textContent = S.score;
   document.getElementById('final-wave').textContent = S.wave;
   document.getElementById('game-over').style.display = 'flex';
-  controller.pendingFire = 0;
-  sendEvent('OVER', S.score);
+  sendEvent('SCORE', S.score);
 }
 
 function restartGame() {
   S.score = 0; S.kills = 0; S.health = 100;
-  S.speed = 1.2; S.targetSpeed = 1.2;
+  S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;
   S.fireCD = 0; S.dmgCD = 0; S.over = false; S.running = true;
-  S.fire = false; S.stealth = false;
-  controller.pendingFire = 0;
+  S.fire = false; S.potThrottle = -1;
   S.camX = 0; S.camY = 0; S.sCamX = 0; S.sCamY = 0;
   S.wave = 1; S.waveEnemiesAlive = 0; S.waveTransition = false; S.waveDelay = 0;
+  mouseOrbitH = 0; mouseOrbitV = 0;
 
   projectiles.forEach(p => p.remove());      projectiles.length = 0;
   enemyProjectiles.forEach(p => p.remove()); enemyProjectiles.length = 0;
@@ -518,10 +569,10 @@ function restartGame() {
   enemies.forEach(e => e.remove());          enemies.length = 0;
 
   initPlayer();
-  sendEvent('START', 1);
   spawnWave(1);
   document.getElementById('game-over').style.display = 'none';
   document.getElementById('hud').style.display = 'block';
+  renderer.domElement.requestPointerLock();
   loop();
 }
 
@@ -530,7 +581,7 @@ function loop() {
   if (!S.running) return;
   requestAnimationFrame(loop);
 
-  readInputs();
+  readKeyboard();
   updatePlayer();
   S.dmgCD = Math.max(0, S.dmgCD - 1);
 
@@ -543,6 +594,7 @@ function loop() {
   updateWaveTransition();
   updateCamera();
   updateHUD();
+  updateMinimap();
 
   renderer.render(scene, camera);
 }
@@ -559,8 +611,8 @@ document.getElementById('start-screen').addEventListener('click', () => {
   document.getElementById('start-screen').style.display = 'none';
   document.getElementById('hud').style.display = 'block';
   renderer.domElement.focus();
+  renderer.domElement.requestPointerLock();
   S.running = true;
-  sendEvent('START', 1);
   spawnWave(1);
   loop();
 });

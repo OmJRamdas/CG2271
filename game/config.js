@@ -1,7 +1,7 @@
 /* ===== config.js — Sky Strike constants, state & helpers ===== */
 
 const C = {
-  WORLD: 800,
+  WORLD: 400,
   GROUND_Y: -60,
   START_ALT: 80,
 
@@ -13,16 +13,19 @@ const C = {
 
   // Player flight
   MIN_SPD: 0.3,
-  MAX_SPD: 2.8,
+  MAX_SPD: 1.0,
+  CEILING: 1200,          // altitude ceiling (just below 1500 render distance)
   CAM_DIST: 14,
   CAM_H: 5,
   CAM_LERP: 0.055,
   CAM_ORBIT_SPD: 1.2,
   CAM_ORBIT_LERP: 0.06,
+  MOUSE_SENS: 0.003,      // pointer-lock mouse sensitivity
+  MOUSE_V_CLAMP: 1.2,     // max vertical orbit (radians)
   CTRL_LERP: 0.07,
-  PITCH_SPD: 0.028,
-  ROLL_SPD: 0.032,
-  YAW_SPD: 0.018,
+  PITCH_SPD: 0.05,
+  ROLL_SPD: 0.1,
+  YAW_SPD: 0.05,
   BANK_YAW: 0.012,
   DMG_COOLDOWN: 40,
 
@@ -44,9 +47,9 @@ const C = {
 
 /* ===== Mutable game state ===== */
 const S = {
-  score: 0, kills: 0, health: 100, speed: 1.2, targetSpeed: 1.2,
+  score: 0, kills: 0, health: 100, speed: 0.6, targetSpeed: 0.6,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
-  stealth: false,          // Fresh MCX LDR reports darkness
+  potThrottle: -1,          // -1 = pot not connected; 0..1 from MCX
   camX: 0, camY: 0,        // raw joystick / mouse camera input
   sCamX: 0, sCamY: 0,      // smoothed camera orbit
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
@@ -66,3 +69,20 @@ const particles = [];
 /* ===== Helpers ===== */
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function lerp(a, b, t) { return a + (b - a) * t; }
+
+/* Circular pac-man wrap — teleport through the origin when past radius */
+function wrapPos(pos) {
+  const r = Math.sqrt(pos.x * pos.x + pos.z * pos.z);
+  if (r > C.WORLD) {
+    const scale = -(C.WORLD - 2) / r;
+    pos.x *= scale;
+    pos.z *= scale;
+  }
+}
+
+/* wrappedTarget: for a circular map, just use direct position.
+ * Both objects are wrapped each frame so they're always inside the circle.
+ */
+function wrappedTarget(observer, target, out) {
+  out.copy(target);
+}

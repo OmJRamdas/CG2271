@@ -7,6 +7,7 @@ const _eUp     = new THREE.Vector3(0, 1, 0);
 const _lookMat = new THREE.Matrix4();
 const _targetQ = new THREE.Quaternion();
 const _awayDir = new THREE.Vector3();
+const _wrappedP = new THREE.Vector3();  // closest wrapped player position
 
 /* AI states: APPROACH → FLYBY → DISENGAGE → LOOP → APPROACH … */
 const ST = { APPROACH: 0, FLYBY: 1, DISENGAGE: 2, LOOP: 3 };
@@ -76,7 +77,7 @@ class Enemy {
   spawn() {
     const angle = Math.random() * Math.PI * 2;
     const elev  = (Math.random() - 0.5) * 1.2;
-    const dist  = 180 + Math.random() * 120;
+    const dist  = 120 + Math.random() * 80;
     const px = player.mesh ? player.mesh.position.x : 0;
     const py = player.mesh ? player.mesh.position.y : C.START_ALT;
     const pz = player.mesh ? player.mesh.position.z : 0;
@@ -85,9 +86,12 @@ class Enemy {
       Math.max(C.GROUND_Y + 15, py + elev * 80),
       pz + Math.sin(angle) * dist
     );
+    wrapPos(this.mesh.position);
     // Face toward player
-    _toPlayer.copy(player.mesh ? player.mesh.position : new THREE.Vector3(0, C.START_ALT, 0))
-      .sub(this.mesh.position).normalize();
+    wrappedTarget(this.mesh.position,
+      player.mesh ? player.mesh.position : new THREE.Vector3(0, C.START_ALT, 0),
+      _wrappedP);
+    _toPlayer.copy(_wrappedP).sub(this.mesh.position).normalize();
     this.mesh.lookAt(this.mesh.position.clone().add(_toPlayer));
     this.state = ST.APPROACH;
     this.timer = 0;
@@ -96,7 +100,9 @@ class Enemy {
   update() {
     if (!this.alive) return;
 
-    _toPlayer.copy(player.mesh.position).sub(this.mesh.position);
+    // Use closest wrapped player position for all AI calculations
+    wrappedTarget(this.mesh.position, player.mesh.position, _wrappedP);
+    _toPlayer.copy(_wrappedP).sub(this.mesh.position);
     const distToPlayer = _toPlayer.length();
     _toPlayer.normalize();
 
@@ -105,8 +111,8 @@ class Enemy {
     switch (this.state) {
 
       case ST.APPROACH:
-        // Slerp toward player
-        _lookMat.lookAt(this.mesh.position, player.mesh.position, _eUp);
+        // Slerp toward wrapped player position
+        _lookMat.lookAt(this.mesh.position, _wrappedP, _eUp);
         _targetQ.setFromRotationMatrix(_lookMat);
         this.mesh.quaternion.slerp(_targetQ, this.turnRate);
 
@@ -138,8 +144,8 @@ class Enemy {
         break;
 
       case ST.DISENGAGE:
-        // Climb and veer away
-        _awayDir.copy(this.mesh.position).sub(player.mesh.position).normalize();
+        // Climb and veer away (from wrapped player)
+        _awayDir.copy(this.mesh.position).sub(_wrappedP).normalize();
         _awayDir.y += 0.3;
         _awayDir.normalize();
         const awayTarget = this.mesh.position.clone().add(_awayDir.multiplyScalar(50));
@@ -155,8 +161,8 @@ class Enemy {
         break;
 
       case ST.LOOP:
-        // Turn back for next run
-        _lookMat.lookAt(this.mesh.position, player.mesh.position, _eUp);
+        // Turn back for next run (toward wrapped player)
+        _lookMat.lookAt(this.mesh.position, _wrappedP, _eUp);
         _targetQ.setFromRotationMatrix(_lookMat);
         this.mesh.quaternion.slerp(_targetQ, 0.015);
 
@@ -175,7 +181,8 @@ class Enemy {
     _eFwd.set(0, 0, -1).applyQuaternion(this.mesh.quaternion);
     this.mesh.position.addScaledVector(_eFwd, this.speed);
 
-    // Altitude floor
+    // Wrap and altitude floor
+    wrapPos(this.mesh.position);
     if (this.mesh.position.y < C.GROUND_Y + 10) {
       this.mesh.position.y = C.GROUND_Y + 10;
     }
@@ -215,7 +222,8 @@ class Enemy {
     S.kills++;
     S.waveEnemiesAlive--;
     addKillMsg('+10 ENEMY DOWN');
-    sendGameState();
+    sendEvent('HIT', 1);
+    sendEvent('SCORE', S.score);
   }
 
   remove() { scene.remove(this.mesh); }
@@ -237,6 +245,7 @@ class EnemyProjectile {
   }
   update() {
     this.mesh.position.addScaledVector(this.dir, this.speed);
+    wrapPos(this.mesh.position);
     this.life++;
     if (this.life > C.E_PROJ_LIFE) this.alive = false;
   }
