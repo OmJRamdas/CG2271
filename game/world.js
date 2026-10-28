@@ -3,7 +3,7 @@
 /* ===== Renderer ===== */
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x7ec8e3);
-scene.fog = new THREE.FogExp2(0x7ec8e3, 0.0015);
+scene.fog = new THREE.FogExp2(0x7ec8e3, 0.002);
 
 const camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.5, 1500);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -89,8 +89,8 @@ function makeplane(body, accent) {
 
 /* ===== Environment ===== */
 function buildWorld() {
-  // Terrain
-  const tg = new THREE.PlaneGeometry(C.WORLD * 2, C.WORLD * 2, 80, 80);
+  // Circular terrain
+  const tg = new THREE.CircleGeometry(C.WORLD, 80, 0, Math.PI * 2);
   const pos = tg.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i), y = pos.getY(i);
@@ -105,14 +105,34 @@ function buildWorld() {
   terrain.position.y = C.GROUND_Y;
   scene.add(terrain);
 
-  // Water
-  const wg = new THREE.PlaneGeometry(C.WORLD * 4, C.WORLD * 4);
-  const water = new THREE.Mesh(wg, new THREE.MeshPhongMaterial({
-    color: 0x2266aa, transparent: true, opacity: 0.7, flatShading: true
-  }));
-  water.rotation.x = -Math.PI / 2;
-  water.position.y = C.GROUND_Y - 12;
-  scene.add(water);
+  // Fog wall cylinder surrounding the map border
+  const fogHeight = C.CEILING - C.GROUND_Y;
+  const fogGeo = new THREE.CylinderGeometry(C.WORLD * 0.95, C.WORLD * 0.95, fogHeight, 64, 1, true);
+  const fogMat = new THREE.MeshBasicMaterial({
+    color: 0xc8dde8,
+    transparent: true,
+    opacity: 0.45,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const fogWall = new THREE.Mesh(fogGeo, fogMat);
+  fogWall.position.y = C.GROUND_Y + fogHeight / 2;
+  scene.add(fogWall);
+
+  // Second, slightly larger fog layer for depth
+  const fogGeo2 = new THREE.CylinderGeometry(C.WORLD * 1.05, C.WORLD * 1.05, fogHeight, 64, 1, true);
+  const fogMat2 = new THREE.MeshBasicMaterial({
+    color: 0xb0c8d8,
+    transparent: true,
+    opacity: 0.3,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const fogWall2 = new THREE.Mesh(fogGeo2, fogMat2);
+  fogWall2.position.y = C.GROUND_Y + fogHeight / 2;
+  scene.add(fogWall2);
 
   // Clouds
   const cmat = new THREE.MeshPhongMaterial({ color: 0xffffff, transparent: true, opacity: 0.75, flatShading: true });
@@ -127,10 +147,12 @@ function buildWorld() {
       puff.position.set((Math.random() - 0.5) * s * 1.5, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * s);
       cg.add(puff);
     }
+    const cAngle = Math.random() * Math.PI * 2;
+    const cDist = Math.random() * C.WORLD * 0.75;
     cg.position.set(
-      (Math.random() - 0.5) * C.WORLD * 1.5,
+      Math.cos(cAngle) * cDist,
       120 + Math.random() * 250,
-      (Math.random() - 0.5) * C.WORLD * 1.5
+      Math.sin(cAngle) * cDist
     );
     scene.add(cg);
   }
@@ -143,7 +165,7 @@ function buildWorld() {
     const s = 40 + Math.random() * 80;
     m.scale.set(s, s * 1.2, s);
     const angle = (i / 20) * Math.PI * 2;
-    const dist = C.WORLD * 0.8 + Math.random() * 200;
+    const dist = C.WORLD * 0.8 + Math.random() * (C.WORLD * 0.25);
     m.position.set(Math.cos(angle) * dist, C.GROUND_Y + s * 0.5, Math.sin(angle) * dist);
     scene.add(m);
   }
