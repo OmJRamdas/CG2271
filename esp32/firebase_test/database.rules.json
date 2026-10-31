@@ -1,0 +1,10 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "skyStrike": {
+      ".read": "auth != null && auth.uid === 'Dt2TNnBsd0dLZPwImZIE57SDLIw1'",
+      ".write": "auth != null && auth.uid === 'Dt2TNnBsd0dLZPwImZIE57SDLIw1'"
+    }
+  }
+}
