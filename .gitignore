@@ -4,3 +4,4 @@ __pycache__/
 mcx/extras/
 .build/
 node_modules/
+esp32/firebase_test/config.h
