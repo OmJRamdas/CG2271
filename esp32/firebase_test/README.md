@@ -1,4 +1,42 @@
-# First Firebase test
+# Firebase high-score test
+
+## Current behavior
+
+The sketch now reads `/skyStrike/highScore` instead of writing `test: 123`.
+It connects to `wss://skystrike-relay.onrender.com` as the ESP32 client and accepts
+`{"type":"submit_score","runId":"unique-id","score":30}` from the updated game.
+Legacy SCORE/ROLL events are ignored. Only connect one ESP32 to this relay.
+
+Completed scores enter an eight-entry RAM queue, including before authentication
+finishes. The sketch rereads Firebase before each comparison. Lower/equal scores
+do not write; higher scores use an ETag-conditional PUT so a concurrent change
+cannot be overwritten without another read and comparison. Failed operations
+stay queued and retry after 10 seconds. Queue overflow is reported as a rejection.
+Queued scores are lost on reset. The most recent received run and queued runs are
+deduplicated in memory; there is no persistent game-history deduplication yet.
+
+Authentication is reused and renewed by signing in again after 50 minutes or an
+HTTP 401 response. Browser replies, high-score display, and MCU celebration
+events are not implemented yet. HTTPS is still synchronous in this standalone
+test; do not merge into the sensor loop until networking is separated.
+
+Upload to your personal **ESP32S3 Dev Module** (S2 is also supported). Install
+**ArduinoJson 7** and **WebSockets by Markus Sattler**. Keep the existing private
+`config.h` and published device UID rules. Open the updated local `game/index.html`
+and connect it to the relay; the hosted game needs a redeploy to send submit_score.
+
+Hardware verification:
+1. Finish a game with a score above Firebase's current highScore. Expect
+   `[FIREBASE] New high score saved: ...` and verify the Data tab.
+2. Finish with a lower or equal score. Expect `database unchanged`.
+3. Reset the ESP32. Confirm startup reads the saved record.
+4. Submit before startup authentication completes. Confirm it is processed later.
+5. Lose internet after receiving a score. Restore it and verify the queued retry.
+
+The remaining sections describe the original smoke test for reference; its
+`test: 123` messages no longer apply to the current sketch.
+
+## Original smoke test
 
 This standalone sketch signs in as your device account, checks its UID, writes
 the number `123` to `/skyStrike/test`, then reads and verifies it. It does not
