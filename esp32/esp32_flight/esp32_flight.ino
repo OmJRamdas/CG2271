@@ -35,6 +35,9 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include <esp_random.h>
+#include <time.h>
+#include "config.h"
+#include "FirebaseWorker.h"
 #include "McxLink.h"
 #include "ButtonEvents.h"
 #include "TiltController.h"
@@ -69,14 +72,11 @@ TiltController tilt(originalDirections());
  *  WIFI & WEBSOCKET CONFIG
  *  *** EDIT THESE BEFORE UPLOADING ***
  * ════════════════════════════════════════════ */
-const char* WIFI_SSID = "S22";
-const char* WIFI_PASS = "pzlc1245";
-// Local relay: laptop's IPv4 on the hotspot (ipconfig), port 3000, WS_USE_SSL 0.
-// Cloud relay: e.g. "cg2271-relay.onrender.com", port 443, WS_USE_SSL 1.
-#define WS_USE_SSL      0
-const char* WS_HOST   = "10.166.151.55";
-const uint16_t WS_PORT = 3000;
-const char* WS_PATH    = "/";
+// Credentials are in the private config.h (copy config.example.h).
+#define WS_USE_SSL 1
+const char* WS_HOST = "skystrike-relay.onrender.com";
+const uint16_t WS_PORT = 443;
+const char* WS_PATH = "/";
 
 /* ════════════════════════════════════════════
  *  TUNING CONSTANTS
@@ -91,6 +91,11 @@ const char* WS_PATH    = "/";
  * ════════════════════════════════════════════ */
 WebSocketsClient webSocket;
 bool wsConnected = false;
+bool firebaseAvailable = false;
+bool wifiWasConnected = false;
+uint32_t lastWifiRetryAt = 0;
+FirebaseWorker::Reply pendingFirebaseReply;
+bool hasPendingFirebaseReply = false;
 
 // Joystick calibration (read at startup)
 int joyXCenter = 2048, joyYCenter = 2048;
@@ -202,6 +207,54 @@ static void serviceMCX(uint32_t now) {
 /* ════════════════════════════════════════════
  *  WEBSOCKET
  * ════════════════════════════════════════════ */
+static void serviceWiFi(uint32_t now) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected != wifiWasConnected) {
+    wifiWasConnected = connected;
+    if (connected) {
+      Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+      configTime(0, 0, "time.google.com", "pool.ntp.org");
+    } else {
+      wsConnected = false;
+      hasCloudState = false;
+      mcx.suspend();
+      webSocket.disconnect();
+      Serial.println("[WiFi] Lost hotspot; reconnecting in background.");
+    }
+  }
+  if (!connected && uint32_t(now - lastWifiRetryAt) >= 30000) {
+    lastWifiRetryAt = now;
+    WiFi.reconnect();
+  }
+}
+
+// This loop is the sole WebSocket owner. HTTPS stays in the Firebase task.
+static void serviceFirebaseReplies() {
+  if (!firebaseAvailable || !wsConnected) return;
+  if (!hasPendingFirebaseReply) {
+    hasPendingFirebaseReply = FirebaseWorker::receive(pendingFirebaseReply);
+  }
+  if (!hasPendingFirebaseReply) return;
+  JsonDocument result;
+  if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Ready) {
+    result["type"] = "high_score_ready";
+  } else {
+    result["highScore"] = pendingFirebaseReply.highScore;
+    if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Best) {
+      result["type"] = "high_score";
+      result["requestId"] = pendingFirebaseReply.id;
+    } else {
+      result["type"] = "high_score_result";
+      result["runId"] = pendingFirebaseReply.id;
+      result["score"] = pendingFirebaseReply.score;
+      result["newRecord"] = pendingFirebaseReply.newRecord;
+    }
+  }
+  String json;
+  serializeJson(result, json);
+  if (webSocket.sendTXT(json)) hasPendingFirebaseReply = false;
+}
+
 static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
 
@@ -209,6 +262,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       wsConnected = true;
       Serial.println("[WS] Connected to relay");
       webSocket.sendTXT("{\"type\":\"identify\",\"role\":\"esp32\"}");
+      if (firebaseAvailable) webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
       break;
 
     case WStype_DISCONNECTED:
@@ -224,7 +278,15 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       JsonDocument doc;
       if (deserializeJson(doc, payload, length)) break;
       const char *kind = doc["type"] | "";
-      if (!strcmp(kind, "game_state")) {
+      // High-score traffic never refreshes the MCX game-state watchdog.
+      if (!strcmp(kind, "get_high_score")) {
+        if (firebaseAvailable) FirebaseWorker::requestBest(doc["requestId"] | "");
+      } else if (!strcmp(kind, "submit_score")) {
+        if (!firebaseAvailable || !doc["score"].is<int>() ||
+            !FirebaseWorker::submit(doc["runId"] | "", doc["score"].as<int>())) {
+          Serial.println("[FIREBASE] Score rejected/unavailable; browser will retry.");
+        }
+      } else if (!strcmp(kind, "game_state")) {
         if (!doc["lives"].is<unsigned>() || !doc["score"].is<unsigned long>() ||
             !doc["mode"].is<const char *>()) break;
         if (mcx.setState(doc["lives"].as<unsigned>(), doc["score"].as<unsigned long>(),
@@ -314,21 +376,12 @@ void setup() {
 #endif
 
   // WiFi
-  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  Serial.printf("[WiFi] Connecting to %s in background\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    if (millis() - wifiStart > 15000) {
-      Serial.println("\n[WiFi] TIMEOUT — continuing without WiFi");
-      break;
-    }
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Connected!  IP: %s\n", WiFi.localIP().toString().c_str());
-  }
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWifiRetryAt = millis();
+  configTime(0, 0, "time.google.com", "pool.ntp.org");
 
   // WebSocket: plain ws:// to a local relay, or wss:// to a cloud (HTTPS) relay
 #if WS_USE_SSL
@@ -349,6 +402,11 @@ void setup() {
   tilt.begin(Wire, 0x68);
   Serial.println("[TILT] Keep still near level for about 2.25 seconds");
   Serial.println("[TILT] Serial commands: c=calibrate, r=recenter, i=reinitialize");
+  firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{
+      FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD, DATABASE_URL, DEVICE_UID});
+  if (!firebaseAvailable) {
+    Serial.println("[FIREBASE] Disabled: could not allocate worker queues/task; controls remain active.");
+  }
   Serial.println("\n[READY] Entering main loop\n");
 }
 
@@ -357,7 +415,8 @@ void setup() {
  * ════════════════════════════════════════════ */
 void loop() {
   serviceTilt();  // Poll frequently; TiltController schedules samples at 100 Hz.
-  webSocket.loop();
+  serviceWiFi(millis());
+  if (WiFi.status() == WL_CONNECTED) webSocket.loop();
   readUART();
   const uint32_t now = millis();
   serviceMCX(now);
@@ -384,5 +443,6 @@ void loop() {
     if (sendSensorData(tilt.latest(), jx, jy, presses, throttle, fireHold.held()))
       lastSentFireCount = presses;
   }
+  serviceFirebaseReplies();
   delay(1);
 }

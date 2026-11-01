@@ -35,6 +35,10 @@ announces `New record!` only after a successful save is confirmed by the ESP32.
   input and enqueue work without waiting for Firebase.
 - **FirebaseWorker.h / firebase task:** exclusively owns HTTP/TLS clients, the
   authentication token, pending scores, and the last eight completed outcomes.
+- FirebaseWorker.h is now a small adapter to `../shared/FirebaseWorker.h`. The
+  combined S2 flight sketch uses that same implementation with its own private
+  configuration. Keep the repository's esp32/ directory layout when compiling;
+  the worker no longer has a separate implementation per sketch.
 - A FreeRTOS score queue (8 entries) passes fixed-size copied messages to the
   worker. A one-entry overwrite queue coalesces best-score requests. A response
   queue (12 entries) passes results back. No String objects or JSON pointers cross
@@ -68,7 +72,9 @@ Queues/cache are RAM only: resetting loses pending jobs and deduplication histor
 A write whose acknowledgement is lost can save the record but lose its new-record
 flag on retry; this is not a durable celebration-event delivery system. Closing
 the browser before confirmation can lose its pending submission. MCU celebration
-events and the final S2 flight-firmware integration remain separate work.
+events remain separate work. The combined S2 firmware is in ../esp32_flight/;
+its README lists upload steps and the remaining hardware/browser compatibility
+checks. Do not run both firmwares as ESP32 clients on the same relay at once.
 
 ## Hardware verification
 

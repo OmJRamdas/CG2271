@@ -95,7 +95,9 @@ The pins were chosen from the MCXC444 reference manual's pin-mux table and the F
 
 ## ESP32 tilt integration and controls
 
-Open `esp32/esp32_flight/esp32_flight.ino` in Arduino IDE and select **ESP32S2 Dev Module**. Keep `TiltController.h`, `McxLink.h`, and `ButtonEvents.h` in the same sketch directory. Install **WebSockets by Markus Sattler**, **Adafruit MPU6050**, **Adafruit Unified Sensor**, **Adafruit BusIO**, and **ArduinoJson 7** through Library Manager. Set the sketch's WiFi credentials and relay host/port/path before uploading; enter the same relay's `wss://` URL in the browser.
+Open `esp32/esp32_flight/esp32_flight.ino` in Arduino IDE and select **ESP32S2 Dev Module**. Keep the `esp32/` folder layout, including the sketch's sensor headers and `shared/` Firebase implementation. Install **WebSockets by Markus Sattler**, **Adafruit MPU6050**, **Adafruit Unified Sensor**, **Adafruit BusIO**, and **ArduinoJson 7** through Library Manager. Copy `esp32/esp32_flight/config.example.h` to private, Git-ignored `config.h` and enter Wi-Fi/Firebase credentials. The default relay is `wss://skystrike-relay.onrender.com`; enter that same URL in the browser. Full upload and bench-test instructions are in [the integrated flight sketch guide](esp32/esp32_flight/README.md).
+
+Firebase authentication, high-score reads and conditional writes run in a separate FreeRTOS worker. Sensor sampling, UART, and WebSocket ownership stay in the Arduino loop; queues pass score requests/replies between the tasks. Wi-Fi startup no longer waits for a connection before entering the sensor loop. See the integrated guide's browser/MCX compatibility section: the current browser still needs its legacy gameplay messages reconciled with the firmware's game-state heartbeats; high-score messages alone do not keep the MCX watchdog alive.
 
 Wiring on the ESP32: UART TX GPIO1 / RX GPIO2, joystick X GPIO3 / Y GPIO5 (`USE_JOYSTICK 1`), fire button GPIO7 to ground with the internal pull-up, and MPU SDA GPIO8 / SCL GPIO9 at address `0x68`. Use common ground between boards. The rotary encoder is on the MCXC444 (see MCXC444 wiring), which sends its 0–100 level as `$ENC`; the ESP32 forwards it as `throttle` while fresh (≤ 1500 ms) and sends `-1` otherwise, so the browser falls back to Shift/Ctrl. The browser maps a changed level to target speed, and Shift/Ctrl still adjust between knob movements. `EncoderThrottle.h` is no longer used by the sketch. `fireHeld` (`FireHold.h`, 20 ms debounce) makes holding the button fire repeatedly; taps shorter than a packet still count through `fireCount`. Encoder detent size, direction and hold behaviour are untested on hardware.
 
@@ -247,7 +249,7 @@ For bench testing without a deployed relay. The demo itself should use a cloud r
    - Expect the controller banner, then the red LED slow-blinking ("link lost") until the ESP32 starts sending.
 3. **Network:** turn on a phone hotspot on **2.4 GHz** (iPhone: *Maximize Compatibility*) and connect the laptop to it. Note the laptop's Wireless LAN IPv4 address from `ipconfig`.
 4. **Relay:** run `cd relay`, then `npm install` (first time only), then `node server.js`. Allow Node through Windows Firewall on private networks.
-5. **ESP32:** in `esp32_flight.ino`, set `WIFI_SSID`/`WIFI_PASS`, `WS_HOST` to the laptop's IPv4, `WS_PORT 3000` and `WS_USE_SSL 0`. Upload, then open Serial Monitor at 115200.
+5. **ESP32:** set `WIFI_SSID`/`WIFI_PASSWORD` in private `config.h`. In `esp32_flight.ino`, set `WS_HOST` to the laptop's IPv4, `WS_PORT 3000` and `WS_USE_SSL 0`. Upload, then open Serial Monitor at 115200. Firebase still needs internet access even when the relay is local.
    - Keep the board still for about 2 s while it calibrates.
    - The relay window should print `ESP32 registered`.
    - Don't commit your Wi-Fi password.

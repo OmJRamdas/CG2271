@@ -5,3 +5,4 @@ mcx/extras/
 .build/
 node_modules/
 esp32/firebase_test/config.h
+esp32/esp32_flight/config.h
