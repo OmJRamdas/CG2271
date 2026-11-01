@@ -12,18 +12,35 @@ finishes. The sketch rereads Firebase before each comparison. Lower/equal scores
 do not write; higher scores use an ETag-conditional PUT so a concurrent change
 cannot be overwritten without another read and comparison. Failed operations
 stay queued and retry after 10 seconds. Queue overflow is reported as a rejection.
-Queued scores are lost on reset. The most recent received run and queued runs are
-deduplicated in memory; there is no persistent game-history deduplication yet.
+Queued scores are lost on reset. Queued runs and the last eight completed results
+are deduplicated in memory; there is no persistent game-history deduplication yet.
+Completed results include the run ID, submitted score, high score, and new-record
+flag, and can be replayed to the browser after a lost response. An unacknowledged
+PUT followed by a reset/network failure can still lose the new-record flag even
+though the database value was saved; this is not a durable event delivery system.
 
 Authentication is reused and renewed by signing in again after 50 minutes or an
-HTTP 401 response. Browser replies, high-score display, and MCU celebration
-events are not implemented yet. HTTPS is still synchronous in this standalone
+HTTP 401 response. Browser replies and the best-score display are implemented;
+MCU celebration events are not. HTTPS is still synchronous in this standalone
 test; do not merge into the sensor loop until networking is separated.
 
 Upload to your personal **ESP32S3 Dev Module** (S2 is also supported). Install
 **ArduinoJson 7** and **WebSockets by Markus Sattler**. Keep the existing private
 `config.h` and published device UID rules. Open the updated local `game/index.html`
 and connect it to the relay; the hosted game needs a redeploy to send submit_score.
+The connection address is prefilled. Connect on the start screen to load the best
+score. On game over, the UI waits for an ESP32 result before announcing a record.
+It retries pending requests every 10 seconds, including when the ESP32 starts
+later than the browser. Unconfirmed scores remain only in browser memory, so
+closing/reloading the page before saving can lose them.
+
+WebSocket messages:
+- Browser: `{"type":"get_high_score","requestId":"unique-id"}`
+- ESP32: `{"type":"high_score","requestId":"unique-id","highScore":30}`
+- Browser: `{"type":"submit_score","runId":"unique-run","score":40}`
+- ESP32: `{"type":"high_score_result","runId":"unique-run","score":40,"highScore":40,"newRecord":true}`
+- ESP32 announces `{"type":"high_score_ready"}` on Firebase startup/relay reconnect
+  so the browser can request the record again.
 
 Hardware verification:
 1. Finish a game with a score above Firebase's current highScore. Expect
@@ -32,6 +49,9 @@ Hardware verification:
 3. Reset the ESP32. Confirm startup reads the saved record.
 4. Submit before startup authentication completes. Confirm it is processed later.
 5. Lose internet after receiving a score. Restore it and verify the queued retry.
+6. Connect before/after ESP32 startup. Check the same best score appears on the
+   start screen, HUD and game-over screen. Only a saved higher score should show
+   `New record!`; a lower/equal score should show `best score unchanged`.
 
 The remaining sections describe the original smoke test for reference; its
 `test: 123` messages no longer apply to the current sketch.

@@ -150,6 +150,65 @@ function readKeyboard() {
   else if (keys['ArrowDown']) S.camY = -1;
 }
 
+/* ===== High-score display ===== */
+let bestScore = null;
+let bestRequestId = null;
+const pendingScores = new Map();
+
+function displayBestScore() {
+  const text = bestScore === null ? '—' : String(bestScore);
+  for (const id of ['start-best-score', 'hud-best-score', 'final-best-score']) {
+    document.getElementById(id).textContent = text;
+  }
+}
+
+function requestBestScore() {
+  bestRequestId = createRunId();
+  document.getElementById('best-score-status').textContent = 'Loading best score…';
+  sendScoreRequests();
+}
+
+function sendScoreRequests() {
+  if (!ws || ws.readyState !== 1) return;
+  if (bestRequestId) {
+    ws.send(JSON.stringify({ type: 'get_high_score', requestId: bestRequestId }));
+  }
+  for (const submission of pendingScores.values()) ws.send(JSON.stringify(submission));
+}
+
+function receiveHighScore(d) {
+  if (d.type === 'high_score_ready') { requestBestScore(); return; }
+  if (d.type !== 'high_score' && d.type !== 'high_score_result') return;
+  if (!Number.isInteger(d.highScore) || d.highScore < 0 || d.highScore > 2147483647) return;
+  if (d.type === 'high_score') {
+    if (d.requestId !== bestRequestId) return;
+    bestRequestId = null;
+    document.getElementById('best-score-status').textContent = '';
+  } else {
+    const pending = pendingScores.get(d.runId);
+    if (!pending || pending.score !== d.score || typeof d.newRecord !== 'boolean' ||
+        d.highScore < d.score || (d.newRecord && d.highScore !== d.score)) return;
+    pendingScores.delete(d.runId);
+    if (d.runId === runId && S.over) {
+      document.getElementById('score-save-status').textContent =
+        d.newRecord ? 'New record!' : 'Score checked — best score unchanged.';
+    }
+  }
+  // A delayed response for an older game must not lower the displayed record.
+  bestScore = Math.max(bestScore === null ? 0 : bestScore, d.highScore);
+  displayBestScore();
+}
+
+function queueFinalScore() {
+  pendingScores.set(runId, { type: 'submit_score', runId, score: S.score });
+  document.getElementById('score-save-status').textContent =
+    ws && ws.readyState === 1 ? 'Checking high score…' : 'Connect to check and save your score.';
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(pendingScores.get(runId)));
+}
+
+// Handles either startup order and retries when a response is lost.
+setInterval(sendScoreRequests, 10000);
+
 /* ===== WebSocket ===== */
 function toggleWS() {
   if (ws && ws.readyState <= 1) { ws.close(); return; }
@@ -161,15 +220,21 @@ function toggleWS() {
       document.getElementById('ws-dot').classList.add('on');
       document.getElementById('ws-btn').textContent = 'Disconnect';
       ws.send(JSON.stringify({ type: 'identify', role: 'game' }));
+      requestBestScore();
     };
     ws.onclose = () => {
       document.getElementById('ws-dot').classList.remove('on');
       document.getElementById('ws-btn').textContent = 'Connect';
+      document.getElementById('best-score-status').textContent = 'Offline — connect to load best score.';
+      if (pendingScores.has(runId) && S.over) {
+        document.getElementById('score-save-status').textContent = 'Connection lost — score pending; reconnect to retry.';
+      }
     };
     ws.onerror = () => ws.close();
     ws.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
+        receiveHighScore(d);
         if (d.type === 'sensor') {
           if (d.pitch !== undefined) S.pIn = clamp(d.pitch, -1, 1);
           if (d.roll  !== undefined) S.rIn = clamp(d.roll, -1, 1);
@@ -563,13 +628,12 @@ function gameOver() {
   document.getElementById('game-over').style.display = 'flex';
   sendEvent('SCORE', S.score);
   // Separate from legacy SCORE telemetry: only this message is a completed run.
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'submit_score', runId, score: S.score }));
-  }
+  queueFinalScore();
 }
 
 function restartGame() {
   runId = createRunId();
+  document.getElementById('score-save-status').textContent = '';
   S.score = 0; S.kills = 0; S.health = 100;
   S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;

@@ -22,12 +22,43 @@ static String idToken;
 static uint32_t authenticatedAt = 0;
 static uint32_t lastSaveAttemptAt = 0;
 static bool saveAttempted = false;
-struct PendingScore { char runId[65]; int score; };
+struct PendingScore {
+  char runId[65]; int score; int highScore; bool newRecord; bool processed;
+};
 static PendingScore scoreQueue[8];
 static unsigned scoreHead = 0, scoreCount = 0;
+static PendingScore completedScores[8];
+static unsigned completedCount = 0, completedNext = 0;
+static char pendingReadId[65] = "";
+static int cachedHighScore = 0;
+static uint32_t lastReadAttemptAt = 0;
+static bool readAttempted = false;
 
 WebSocketsClient webSocket;
-static char lastReceivedRunId[65] = "";
+
+static bool sendScoreResult(const PendingScore &job) {
+  if (!webSocket.isConnected()) return false;
+  JsonDocument result;
+  result["type"] = "high_score_result";
+  result["runId"] = job.runId;
+  result["score"] = job.score;
+  result["highScore"] = job.highScore;
+  result["newRecord"] = job.newRecord;
+  String json;
+  serializeJson(result, json);
+  return webSocket.sendTXT(json);
+}
+
+static bool validId(const char *id) {
+  const size_t length = strlen(id);
+  if (!length || length > 64) return false;
+  for (size_t i = 0; i < length; ++i) {
+    const char c = id[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
+  }
+  return true;
+}
 
 // Never print request URLs (database URLs contain an auth token), passwords,
 // or authentication response bodies (which contain tokens).
@@ -113,8 +144,10 @@ static bool runTest() {
   }
 
   if (result.isNull()) {
+    cachedHighScore = 0;
     Serial.println("[FIREBASE] No high score yet; starting at 0.");
   } else if (result.is<int>() && result.as<int>() >= 0) {
+    cachedHighScore = result.as<int>();
     Serial.printf("[FIREBASE] Stored high score: %d\n",
                   result.as<int>());
   } else {
@@ -123,11 +156,12 @@ static bool runTest() {
   }
 
   Serial.println("[READY] Waiting for a completed-game score.");
+  if (webSocket.isConnected()) webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
   return true;
 }
 
 // Run outside the WebSocket callback. Keep a failed job queued for retry.
-static bool saveHighScore(const PendingScore &job) {
+static bool saveHighScore(PendingScore &job) {
   String base = DATABASE_URL;
   while (base.endsWith("/")) base.remove(base.length() - 1);
   const String url = base + "/skyStrike/highScore.json?auth=" + idToken;
@@ -146,6 +180,9 @@ static bool saveHighScore(const PendingScore &job) {
   }
   const int best = value.isNull() ? 0 : value.as<int>();
   if (job.score <= best) {
+    cachedHighScore = job.highScore = best;
+    job.newRecord = false;
+    job.processed = true;
     Serial.printf("[SCORE] %d did not beat %d; database unchanged.\n", job.score, best);
     return true;
   }
@@ -165,7 +202,34 @@ static bool saveHighScore(const PendingScore &job) {
     return false;
   }
   Serial.printf("[FIREBASE] New high score saved: %d (previous: %d).\n", job.score, best);
+  cachedHighScore = job.highScore = job.score;
+  job.newRecord = true;
+  job.processed = true;
   return true;
+}
+
+static void replyToHighScoreRequest() {
+  // Read again on browser connection, rather than serving an old local value.
+  String base = DATABASE_URL;
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+  String response;
+  const int code = request(base + "/skyStrike/highScore.json?auth=" + idToken,
+                           "GET", "", response);
+  JsonDocument value;
+  if (code != 200 || deserializeJson(value, response) ||
+      (!value.isNull() && (!value.is<int>() || value.as<int>() < 0))) {
+    if (code == 401) { finished = false; attempted = false; idToken = ""; }
+    Serial.printf("[FIREBASE] Best-score lookup failed (%d); will retry.\n", code);
+    return;
+  }
+  cachedHighScore = value.isNull() ? 0 : value.as<int>();
+  JsonDocument result;
+  result["type"] = "high_score";
+  result["requestId"] = pendingReadId;
+  result["highScore"] = cachedHighScore;
+  String json;
+  serializeJson(result, json);
+  if (webSocket.isConnected() && webSocket.sendTXT(json)) pendingReadId[0] = '\0';
 }
 
 void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
@@ -175,6 +239,7 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       webSocket.sendTXT(
         "{\"type\":\"identify\",\"role\":\"esp32\"}"
       );
+      if (finished) webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
       break;
 
     case WStype_DISCONNECTED:
@@ -187,20 +252,24 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       if (deserializeJson(message, payload, length)) break;
 
       const char* messageType = message["type"] | "";
+      if (!strcmp(messageType, "get_high_score")) {
+        const char *id = message["requestId"] | "";
+        if (validId(id)) strcpy(pendingReadId, id);
+        break;
+      }
       // Ignore legacy SCORE telemetry, ROLL, and other gameplay events.
       if (strcmp(messageType, "submit_score") != 0) break;
       if (!message["runId"].is<const char*>() || !message["score"].is<int>()) break;
       const char* run = message["runId"].as<const char*>();
-      const size_t runLength = strlen(run);
       const int score = message["score"].as<int>();
-      if (runLength == 0 || runLength > 64 || score < 0 || score > 9999999) break;
-      for (size_t i = 0; i < runLength; ++i) {
-        const char c = run[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '-' || c == '_')) return;
+      if (!validId(run) || score < 0 || score > 9999999) break;
+      // Replay the original outcome if the browser missed its response.
+      for (unsigned i = 0; i < completedCount; ++i) {
+        if (strcmp(completedScores[i].runId, run) == 0) {
+          if (completedScores[i].score == score) sendScoreResult(completedScores[i]);
+          return;
+        }
       }
-      // Suppress a repeat of the most recently received run during this boot.
-      if (strcmp(lastReceivedRunId, run) == 0) break;
       for (unsigned i = 0; i < scoreCount; ++i) {
         if (strcmp(scoreQueue[(scoreHead + i) % 8].runId, run) == 0) return;
       }
@@ -211,8 +280,8 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       PendingScore &job = scoreQueue[(scoreHead + scoreCount) % 8];
       strcpy(job.runId, run);
       job.score = score;
+      job.processed = false;
       ++scoreCount;
-      strcpy(lastReceivedRunId, run);
       Serial.printf("[SCORE] Completed game %s: %d (queued for comparison)\n", run, score);
       break;
     }
@@ -275,13 +344,23 @@ void loop() {
   if (connected && finished && scoreCount &&
       (!saveAttempted || uint32_t(millis() - lastSaveAttemptAt) >= 10000)) {
     saveAttempted = true;
-    const bool processed = saveHighScore(scoreQueue[scoreHead]);
+    PendingScore &job = scoreQueue[scoreHead];
+    const bool processed = job.processed || saveHighScore(job);
     lastSaveAttemptAt = millis();
-    if (processed) {
+    if (processed && sendScoreResult(job)) {
+      completedScores[completedNext] = job;
+      completedNext = (completedNext + 1) % 8;
+      if (completedCount < 8) ++completedCount;
       scoreHead = (scoreHead + 1) % 8;
       --scoreCount;
       saveAttempted = false;
     }
+  }
+  if (connected && finished && pendingReadId[0] && webSocket.isConnected() &&
+      (!readAttempted || uint32_t(millis() - lastReadAttemptAt) >= 10000)) {
+    replyToHighScoreRequest();
+    lastReadAttemptAt = millis();
+    readAttempted = true;
   }
   delay(10);
 }
