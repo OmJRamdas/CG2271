@@ -542,7 +542,19 @@ function updateMinimap() {
 }
 
 /* ===== Game over / restart ===== */
+function createRunId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) +
+    '-' + Math.random().toString(36).slice(2);
+}
+
+let runId = createRunId();
+
 function gameOver() {
+  // Several collisions can end the same frame. Submit only once per game.
+  if (S.over) return;
   S.over = true;
   S.running = false;
   if (document.pointerLockElement) document.exitPointerLock();
@@ -550,9 +562,14 @@ function gameOver() {
   document.getElementById('final-wave').textContent = S.wave;
   document.getElementById('game-over').style.display = 'flex';
   sendEvent('SCORE', S.score);
+  // Separate from legacy SCORE telemetry: only this message is a completed run.
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'submit_score', runId, score: S.score }));
+  }
 }
 
 function restartGame() {
+  runId = createRunId();
   S.score = 0; S.kills = 0; S.health = 100;
   S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;

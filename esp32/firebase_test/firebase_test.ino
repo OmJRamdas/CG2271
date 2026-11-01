@@ -11,12 +11,16 @@
 #include <time.h>
 #include "config.h"
 #include "GoogleRoots.h"
+#include <WebSocketsClient.h>
 
 static bool finished = false;
 static bool wifiWasConnected = false;
 static bool attempted = false;
 static uint32_t lastAttemptAt = 0;
 static uint32_t lastWifiRetryAt = 0;
+
+WebSocketsClient webSocket;
+static char lastReceivedRunId[65] = "";
 
 // Never print request URLs (database URLs contain an auth token), passwords,
 // or authentication response bodies (which contain tokens).
@@ -75,27 +79,79 @@ static bool runTest() {
 
   String base = DATABASE_URL;
   while (base.endsWith("/")) base.remove(base.length() - 1);
-  const String testUrl = base + "/skyStrike/test.json?auth=" + token;
-  Serial.println("[WRITE] Setting /skyStrike/test to 123...");
-  code = request(testUrl, "PUT", "123", response);
+    const String highScoreUrl =
+      base + "/skyStrike/highScore.json?auth=" + token;
+
+  Serial.println("[FIREBASE] Reading high score...");
+  code = request(highScoreUrl, "GET", "", response);
+
   if (code != 200) {
-    Serial.printf("[WRITE] Failed, HTTP/result %d. Check database URL and published rules.\n", code);
+    Serial.printf("[FIREBASE] Read failed, HTTP/result %d\n", code);
     return false;
   }
-  code = request(testUrl, "GET", "", response);
-  if (code != 200) {
-    Serial.printf("[READ] Failed, HTTP/result %d.\n", code);
+
+  JsonDocument result;
+  if (deserializeJson(result, response)) {
+    Serial.println("[FIREBASE] Invalid response.");
     return false;
   }
-  JsonDocument value;
-  if (deserializeJson(value, response) || !value.is<int>() || value.as<int>() != 123) {
-    Serial.println("[READ] Value did not match 123.");
+
+  if (result.isNull()) {
+    Serial.println("[FIREBASE] No high score yet; starting at 0.");
+  } else if (result.is<int>() && result.as<int>() >= 0) {
+    Serial.printf("[FIREBASE] Stored high score: %d\n",
+                  result.as<int>());
+  } else {
+    Serial.println("[FIREBASE] Expected a non-negative number.");
     return false;
   }
-  Serial.println("[PASS] Wrote 123 and read back 123 from Firebase.");
-  Serial.println("Check Realtime Database > Data > skyStrike > test.");
-  Serial.println("Test finished; no more requests until you reset the board.");
+
+  Serial.println("[READY] Waiting for a completed-game score.");
   return true;
+}
+
+void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("[WS] Connected to Render");
+      webSocket.sendTXT(
+        "{\"type\":\"identify\",\"role\":\"esp32\"}"
+      );
+      break;
+
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected");
+      break;
+
+    case WStype_TEXT: {
+      if (length > 512) break;
+      JsonDocument message;
+      if (deserializeJson(message, payload, length)) break;
+
+      const char* messageType = message["type"] | "";
+      // Ignore legacy SCORE telemetry, ROLL, and other gameplay events.
+      if (strcmp(messageType, "submit_score") != 0) break;
+      if (!message["runId"].is<const char*>() || !message["score"].is<int>()) break;
+      const char* run = message["runId"].as<const char*>();
+      const size_t runLength = strlen(run);
+      const int score = message["score"].as<int>();
+      if (runLength == 0 || runLength > 64 || score < 0 || score > 9999999) break;
+      for (size_t i = 0; i < runLength; ++i) {
+        const char c = run[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_')) return;
+      }
+      // Suppress a repeat of the most recently received run during this boot.
+      // Saving/acknowledgement and persistent deduplication will be added later.
+      if (strcmp(lastReceivedRunId, run) == 0) break;
+      strcpy(lastReceivedRunId, run);
+      Serial.printf("[SCORE] Completed game %s: %d (received, not saved yet)\n", run, score);
+      break;
+    }
+
+    default:
+      break;
+  }
 }
 
 void setup() {
@@ -109,9 +165,13 @@ void setup() {
   // Certificate validation requires a correct clock. Synchronization is async.
   configTime(0, 0, "time.google.com", "pool.ntp.org");
   Serial.println("[WIFI] Connecting; waiting for internet and time synchronization...");
+  webSocket.onEvent(onWebSocketEvent);
+  webSocket.beginSSL("skystrike-relay.onrender.com", 443, "/");
+  webSocket.setReconnectInterval(5000);
 }
 
 void loop() {
+  webSocket.loop();
   if (finished) { delay(20); return; }
   const uint32_t now = millis();
   const bool connected = WiFi.status() == WL_CONNECTED;
