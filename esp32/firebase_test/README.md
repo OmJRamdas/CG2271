@@ -1,115 +1,106 @@
-# Firebase high-score test
+# Firebase high-score bridge
 
-## Current behavior
-
-The sketch now reads `/skyStrike/highScore` instead of writing `test: 123`.
-It connects to `wss://skystrike-relay.onrender.com` as the ESP32 client and accepts
-`{"type":"submit_score","runId":"unique-id","score":30}` from the updated game.
-Legacy SCORE/ROLL events are ignored. Only connect one ESP32 to this relay.
-
-Completed scores enter an eight-entry RAM queue, including before authentication
-finishes. The sketch rereads Firebase before each comparison. Lower/equal scores
-do not write; higher scores use an ETag-conditional PUT so a concurrent change
-cannot be overwritten without another read and comparison. Failed operations
-stay queued and retry after 10 seconds. Queue overflow is reported as a rejection.
-Queued scores are lost on reset. Queued runs and the last eight completed results
-are deduplicated in memory; there is no persistent game-history deduplication yet.
-Completed results include the run ID, submitted score, high score, and new-record
-flag, and can be replayed to the browser after a lost response. An unacknowledged
-PUT followed by a reset/network failure can still lose the new-record flag even
-though the database value was saved; this is not a durable event delivery system.
-
-Authentication is reused and renewed by signing in again after 50 minutes or an
-HTTP 401 response. Browser replies and the best-score display are implemented;
-MCU celebration events are not. HTTPS is still synchronous in this standalone
-test; do not merge into the sensor loop until networking is separated.
-
-Upload to your personal **ESP32S3 Dev Module** (S2 is also supported). Install
-**ArduinoJson 7** and **WebSockets by Markus Sattler**. Keep the existing private
-`config.h` and published device UID rules. Open the updated local `game/index.html`
-and connect it to the relay; the hosted game needs a redeploy to send submit_score.
-The connection address is prefilled. Connect on the start screen to load the best
-score. On game over, the UI waits for an ESP32 result before announcing a record.
-It retries pending requests every 10 seconds, including when the ESP32 starts
-later than the browser. Unconfirmed scores remain only in browser memory, so
-closing/reloading the page before saving can lose them.
-
-WebSocket messages:
-- Browser: `{"type":"get_high_score","requestId":"unique-id"}`
-- ESP32: `{"type":"high_score","requestId":"unique-id","highScore":30}`
-- Browser: `{"type":"submit_score","runId":"unique-run","score":40}`
-- ESP32: `{"type":"high_score_result","runId":"unique-run","score":40,"highScore":40,"newRecord":true}`
-- ESP32 announces `{"type":"high_score_ready"}` on Firebase startup/relay reconnect
-  so the browser can request the record again.
-
-Hardware verification:
-1. Finish a game with a score above Firebase's current highScore. Expect
-   `[FIREBASE] New high score saved: ...` and verify the Data tab.
-2. Finish with a lower or equal score. Expect `database unchanged`.
-3. Reset the ESP32. Confirm startup reads the saved record.
-4. Submit before startup authentication completes. Confirm it is processed later.
-5. Lose internet after receiving a score. Restore it and verify the queued retry.
-6. Connect before/after ESP32 startup. Check the same best score appears on the
-   start screen, HUD and game-over screen. Only a saved higher score should show
-   `New record!`; a lower/equal score should show `best score unchanged`.
-
-The remaining sections describe the original smoke test for reference; its
-`test: 123` messages no longer apply to the current sketch.
-
-## Original smoke test
-
-This standalone sketch signs in as your device account, checks its UID, writes
-the number `123` to `/skyStrike/test`, then reads and verifies it. It does not
-change the flight game source or require an MPU, joystick, relay, or MCX.
-Uploading it replaces the flight firmware on the ESP32 until you upload that again.
+Standalone ESP32-S3/S2 test: reads `/skyStrike/highScore`, saves completed-game
+scores only when higher, and returns the best score/new-record result to the game.
+The game connects through `wss://skystrike-relay.onrender.com`. Only connect one
+ESP32 at a time to this relay. Uploading this replaces the firmware on that board;
+it does not change the main flight sketch or MCX firmware.
 
 ## Setup
 
 1. Firebase Authentication: enable Email/Password and create the device user.
-2. Realtime Database > Rules: paste `database.rules.json` and click Publish.
-   These initial rules allow only the specified device UID under `/skyStrike`.
-   Do not enable App Check enforcement for this basic REST test.
-3. Copy `config.example.h` to `config.h` in this folder. Fill in hotspot name,
-   hotspot password, Web API key, device account email, and device account password.
-   URL and UID are already filled in. Do not append the console's `: null` display
-   to the URL. `null` simply means the database currently has no data.
-4. Open `firebase_test.ino` in Arduino IDE. Select ESP32S2 Dev Module and your port.
-5. Install **ArduinoJson by Benoit Blanchon, version 7** using Library Manager.
-   WiFi, WiFiClientSecure and HTTPClient come with the ESP32 board package.
-   This sketch does not need a Firebase library or the browser JavaScript SDK.
-6. Upload and open Serial Monitor at **115200 baud**. Enable mobile data on the
-   hotspot phone; local Wi-Fi alone cannot reach Firebase.
+2. Realtime Database > Rules: publish `database.rules.json` with that user's UID.
+   App Check enforcement is not supported by this basic REST client.
+3. Copy `config.example.h` to `config.h` and enter hotspot credentials, API key,
+   and device email/password. URL and UID are already provided. Do not append
+   the console's `: null` display to the URL; it means the database is empty.
+4. Open `firebase_test.ino` in Arduino IDE. Keep **FirebaseWorker.h**, config.h,
+   and GoogleRoots.h in the sketch folder. Select **ESP32S3 Dev Module** for the
+   personal board, or **ESP32S2 Dev Module** for the team board, and select its port.
+5. Install **ArduinoJson 7** and **WebSockets by Markus Sattler**. Wi-Fi, HTTPS,
+   and FreeRTOS support come with the ESP32 board package.
+6. Enable hotspot mobile data. Upload, open Serial Monitor/Tera Term at **115200**,
+   and reset. Open the local `game/index.html` and click **Connect**; the address
+   is prefilled. The Render-hosted game needs redeploying after browser changes.
 
-Expected final line: `[PASS] Wrote 123 and read back 123 from Firebase.`
+Expect `[WS] Connected to Render`, `[AUTH] Signed in; device UID matches`, and
+`[FIREBASE] Stored high score: ...`. Their order can vary because work is concurrent.
+The browser shows the best score on connection and the game-over screen. It
+announces `New record!` only after a successful save is confirmed by the ESP32.
 
-In the Firebase console's Data tab, expand `skyStrike` to see `test: 123`.
-The sketch stops database requests after success. Reset to run again. It overwrites
-only `/skyStrike/test`, so keep real scores and game data at other paths.
+## Task ownership and responsiveness
 
-## Troubleshooting
+- **firebase_test.ino / Arduino loop:** owns WebSocket callbacks, sends replies,
+  checks Wi-Fi transitions, and schedules reconnection. Callbacks parse/validate
+  input and enqueue work without waiting for Firebase.
+- **FirebaseWorker.h / firebase task:** exclusively owns HTTP/TLS clients, the
+  authentication token, pending scores, and the last eight completed outcomes.
+- A FreeRTOS score queue (8 entries) passes fixed-size copied messages to the
+  worker. A one-entry overwrite queue coalesces best-score requests. A response
+  queue (12 entries) passes results back. No String objects or JSON pointers cross
+  task boundaries, and neither task touches the other's mutable state.
+- The worker checks Wi-Fi/network time every 100 ms. It starts authentication as
+  soon as time is valid; the old 60-second time recheck delay is removed. Failed
+  authentication and database jobs retry after 10 seconds, without blocking the
+  main loop. Authentication is renewed after 50 minutes or HTTP 401.
+- HTTPS remains synchronous **inside the worker**, with bounded request timeouts.
+  The worker yields and is not pinned to a core, so the design also supports the
+  single-core S2. Its stack allocation is 16 KiB (ESP-IDF uses bytes).
+- This removes Firebase waits from the loop; Wi-Fi/WebSocket reconnection can
+  still take time, and shared CPU/network resources still limit overall latency.
+  Physical sensor timing and worker stack headroom must be verified on hardware
+  before integration into esp32_flight.
 
-- No Wi-Fi IP: check hotspot credentials and 2.4 GHz compatibility.
-- Waiting for time: internet or network time access is unavailable. HTTPS needs a
-  correct clock to validate server certificates.
-- Authentication 400: check API key, device login, and Email/Password provider.
-- UID mismatch: the email/password signed into a different device account.
-- Database 401/403: check published UID rules, token access, and App Check settings.
-- Negative HTTP result: network/TLS connection failure; check internet and clock.
-- Database 404: check the database URL.
+## Scores, retries, and limitations
 
-`config.h` is ignored by Git, but manually made source ZIPs can still include it.
-Exclude it before sharing. Authentication tokens and passwords are never printed.
+The worker buffers eight unique pending scores in addition to the input queue.
+It rereads Firebase before comparison. Lower/equal scores do not write. Higher
+scores use an ETag-conditional PUT: a concurrent update causes reread/retry rather
+than overwriting a newer record. Queue-full submissions are logged and the
+browser's 10-second retry can submit again later. ROLL/legacy SCORE stay silent.
 
-## Scope and next step
+Completed results are replayable for the last eight games during this boot. A
+full response queue retains a processed score in the worker; an unsent WebSocket
+reply remains in the main loop until it can be sent. Duplicate completed browser
+requests replay their original outcome. Best-score lookups may be coalesced.
 
-This is a bounded, synchronous HTTPS smoke test, not a production Firebase client.
-It signs in again on each failed test attempt rather than retaining expired tokens.
-The integrated version must renew tokens and perform cloud requests without
-interrupting tilt sampling, UART processing, or game controls.
+Queues/cache are RAM only: resetting loses pending jobs and deduplication history.
+A write whose acknowledgement is lost can save the record but lose its new-record
+flag on retry; this is not a durable celebration-event delivery system. Closing
+the browser before confirmation can lose its pending submission. MCU celebration
+events and the final S2 flight-firmware integration remain separate work.
 
-TLS is verified with public roots downloaded from https://pki.goog/roots.pem.
-`GoogleRoots.h` contains the same PEM bundle for the Arduino sketch. Update it
-from the official source if Google's trust roots change; do not disable TLS checks.
+## Hardware verification
+
+1. Reset with the browser already connected: best score should load once time
+   sync and authentication complete, without the former fixed one-minute delay.
+2. Finish with a higher score: verify `New high score saved`, Firebase's Data tab,
+   and the browser's `New record!` message.
+3. Finish with a lower/equal score: database stays unchanged and no celebration.
+4. Finish before authentication completes: score is queued and processed later.
+5. Interrupt mobile internet while leaving hotspot Wi-Fi enabled. Submit a score:
+   main-loop WebSocket handling must continue independently of blocked HTTPS.
+   Restore internet and verify retry/result. A lost relay path can of course
+   prevent new browser messages reaching the ESP32 during the outage.
+6. Disconnect/reconnect the browser/relay and check pending results recover without
+   duplicate writes. Reset and confirm the stored record persists.
+7. Check sustained play/reconnects for resets, stack overflow, or low-memory issues
+   before porting the worker into the main sensor firmware.
+
+## Privacy and troubleshooting
+
+config.h is Git-ignored but manually created ZIPs may include it: exclude it when
+sharing/submitting. Never print passwords, tokens, auth responses, or request URLs.
+TLS uses Google's public roots in GoogleRoots.h, matching google_roots.pem from
+https://pki.goog/roots.pem. Do not disable Firebase certificate checks.
+
+- No IP: hotspot name/password or 2.4 GHz compatibility.
+- Waiting for time: mobile internet or NTP access unavailable.
+- Auth 400: API key, account credentials, or Email/Password provider.
+- UID mismatch: signed into the wrong device account.
+- Database 401/403: published rules, token, or App Check configuration.
+- Negative HTTP result: network/TLS failure; check clock and internet.
+- `[FATAL]`: queue/task allocation failed; do not continue testing that boot.
 
 References:
 - https://firebase.google.com/docs/reference/rest/auth
