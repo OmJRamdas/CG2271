@@ -222,8 +222,8 @@ class Enemy {
     S.kills++;
     S.waveEnemiesAlive--;
     addKillMsg('+10 ENEMY DOWN');
-    sendEvent('HIT', 1);
-    sendEvent('SCORE', S.score);
+    // A kill is not player damage: update score/state only (HIT = player hit on the MCX).
+    sendGameState();
   }
 
   remove() { scene.remove(this.mesh); }

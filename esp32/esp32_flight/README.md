@@ -14,8 +14,9 @@ Upload this sketch instead of firebase_test when using the real controller.
    matches firebase_test/config.h, so an existing private test configuration can
    be copied here locally. The two config.h files are both Git-ignored; exclude
    them manually from source ZIPs too.
-3. Install ArduinoJson 7, WebSockets by Markus Sattler, Adafruit MPU6050,
-   Adafruit Unified Sensor and Adafruit BusIO. Select **ESP32S2 Dev Module** and
+3. Install ArduinoJson 7, WebSockets by Markus Sattler, Adafruit Unified Sensor
+   and Adafruit BusIO. (Adafruit MPU6050 is not needed: `MpuRegisters.h` drives
+   the MPU directly so clone chips with WHO_AM_I 0x70 work.) Select **ESP32S2 Dev Module** and
    the actual controller's port. Compile/upload esp32_flight.ino.
 4. Default relay settings are SSL enabled, `skystrike-relay.onrender.com`, port
    443, `/`. For a local relay, adjust WS_USE_SSL/WS_HOST/WS_PORT in the sketch.
@@ -54,16 +55,15 @@ share CPU/heap on a single core; profile real sample timing and task stack/heap
 headroom before the demo. WebSocket reconnect/TLS setup can still take time in
 the main loop; moving Firebase does not remove every network latency source.
 
-### Existing browser/MCX compatibility gap
+### Browser/MCX compatibility (resolved)
 
-The current game/game.js sends legacy event SCORE/ROLL/BOOST messages and does
-not send the `game_state` heartbeat expected by this flight firmware. It also
-uses older pot/direct-input handling rather than the firmware's throttle and
-fire counter fields. These mismatches predate this Firebase integration and are
-not changed here. Before the full hardware demo, reconcile browser controller
-handling and add game_state heartbeats (lives, score, IDLE/PLAY/OVER) plus supported
-START/HIT/OVER/BONUS events. Otherwise Firebase high scores can work while the MCX
-watchdog still shows link lost or some hardware controls fail to affect gameplay.
+game/game.js was reconciled with this firmware on the `integration-fixes` branch.
+It sends the `game_state` heartbeat (lives, score, IDLE/PLAY/OVER) every 400 ms
+and on connect, plus the supported START/HIT/BONUS/OVER events (no more
+SCORE/ROLL/BOOST). It reads the firmware's `throttle`, `fireSession`/`fireCount`/
+`firePending`, `fireHeld` and `tiltValid` fields. Press **I** in the game to see
+the live controller inputs and the state last sent to the MCX. High-score
+messages still do not keep the MCX watchdog alive on their own; the heartbeat does.
 
 The shared worker's retry/queue/reset limitations and REST message examples are
 documented in ../firebase_test/README.md. MCU new-record celebration is not added

@@ -27,7 +27,7 @@ try {
     if ($LASTEXITCODE) { throw 'Input compilation failed' }
     & ./.build/test_inputs.exe
     if ($LASTEXITCODE) { throw 'Input tests failed' }
-    node --test game/tests/input.test.js
+    node --test game/tests/input.test.js game/tests/score-submission.test.js
     if ($LASTEXITCODE) { throw 'Browser tests failed' }
     python mcx/tools/esp32_sim.py --selftest
     if ($LASTEXITCODE) { throw 'Simulator tests failed' }

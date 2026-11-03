@@ -116,6 +116,10 @@ document.addEventListener('mousemove', e => {
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
+  if (e.code === 'KeyI' && !e.repeat) {
+    showInputs = !showInputs;
+    document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
+  }
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -149,6 +153,113 @@ function readKeyboard() {
   if (keys['ArrowUp']) S.camY = 1;
   else if (keys['ArrowDown']) S.camY = -1;
 }
+
+/* ===== Controller input ===== */
+const CONTROLLER_STALE_MS = 300;
+const controller = {
+  at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
+  pendingFire: 0, fireSession: null, fireCount: 0,
+  ldrValid: false, dark: false, ldrRaw: 0,
+  fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
+};
+// Press I during a game to show what the hardware controller is sending.
+let showInputs = false;
+let lastSentState = null;
+
+function clearController() {
+  controller.at = -Infinity;
+  controller.pendingFire = 0;
+  controller.fireHeld = false;
+  controller.throttle = null;
+  controller.throttleApplied = null;
+  controller.tiltValid = false;
+  controller.ldrValid = false;
+  controller.dark = false;
+  S.stealth = false;
+  // Keep the last session/count so reconnects do not replay delivered presses.
+}
+
+function receiveSensor(d) {
+  const axes = ['pitch', 'roll', 'yaw', 'joyX', 'joyY'];
+  if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
+  controller.at = performance.now();
+  for (const key of axes) controller[key] = clamp(d[key], -1, 1);
+  controller.tiltValid = d.tiltValid !== false;
+  if (!controller.tiltValid) controller.pitch = controller.roll = controller.yaw = 0;
+  controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
+    d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
+  controller.dark = controller.ldrValid && d.dark;
+  controller.ldrRaw = controller.ldrValid ? d.ldrRaw : 0;
+  controller.fireHeld = d.fireHeld === true;
+  controller.throttle = Number.isFinite(d.throttle) && d.throttle >= 0 && d.throttle <= 100
+    ? d.throttle : null;
+
+  const uint32 = n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
+  let presses = 0;
+  if (uint32(d.fireSession) && uint32(d.fireCount)) {
+    if (controller.fireSession !== d.fireSession) {
+      controller.fireSession = d.fireSession;
+      controller.pendingFire = 0;
+      // A first packet only owns presses still pending at the ESP32, not its
+      // entire boot history. Subsequent counters recover missed sensor packets.
+      presses = uint32(d.firePending) ? d.firePending : (d.fire === true ? 1 : 0);
+      controller.fireCount = d.fireCount;
+    } else {
+      const delta = (d.fireCount - controller.fireCount) >>> 0;
+      if (delta < 0x80000000) {
+        presses = delta;
+        controller.fireCount = d.fireCount;
+      }
+    }
+  } else if (d.fire === true) presses = 1;  // Legacy boolean sender.
+  if (S.running) controller.pendingFire += presses;
+}
+
+function readInputs() {
+  readKeyboard();  // Original keyboard directions and held-space firing.
+  if (!ws || ws.readyState !== 1 || performance.now() - controller.at > CONTROLLER_STALE_MS) {
+    clearController();
+    return;
+  }
+  S.pIn = controller.pitch;
+  S.rIn = controller.roll;
+  S.yIn = controller.yaw;
+  S.camX = controller.joyX;
+  S.camY = controller.joyY;
+  S.stealth = controller.ldrValid && controller.dark;
+  // The encoder reports an absolute level (0..100). Apply it only when it changes,
+  // so Shift/Ctrl keep working between knob movements.
+  if (controller.throttle !== null && controller.throttle !== controller.throttleApplied) {
+    S.targetSpeed = C.MIN_SPD + (controller.throttle / 100) * (C.MAX_SPD - C.MIN_SPD);
+    controller.throttleApplied = controller.throttle;
+  }
+  S.fire = S.fire || controller.fireHeld || controller.pendingFire > 0;
+}
+
+function sendGameState() {
+  if (ws && ws.readyState === 1) {
+    const state = {
+      type: 'game_state',
+      // Preserve the game's 100-point hull; expose three gauge segments to MCX.
+      lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
+      score: Math.floor(clamp(S.score, 0, 9999999)),
+      mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
+    };
+    lastSentState = state;
+    ws.send(JSON.stringify(state));
+  }
+}
+
+function sendEvent(event, value) {
+  if (!['HIT', 'START', 'OVER', 'BONUS'].includes(event)) return;
+  if (ws && ws.readyState === 1) {
+    sendGameState();
+    ws.send(JSON.stringify({ type: 'event', event, value }));
+  }
+}
+
+// Runs on the start screen and after game over too, independently of rendering.
+setInterval(sendGameState, 400);
 
 /* ===== High-score display ===== */
 let bestScore = null;
@@ -215,14 +326,20 @@ function toggleWS() {
   const url = document.getElementById('ws-url').value.trim();
   if (!url) return;
   try {
-    ws = new WebSocket(url);
-    ws.onopen = () => {
+    const socket = new WebSocket(url);
+    ws = socket;
+    clearController();
+    socket.onopen = () => {
+      if (ws !== socket) return;
       document.getElementById('ws-dot').classList.add('on');
       document.getElementById('ws-btn').textContent = 'Disconnect';
-      ws.send(JSON.stringify({ type: 'identify', role: 'game' }));
+      socket.send(JSON.stringify({ type: 'identify', role: 'game' }));
+      sendGameState();   // MCX actuators stay silent until the ESP32 has a game state.
       requestBestScore();
     };
-    ws.onclose = () => {
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      clearController();
       document.getElementById('ws-dot').classList.remove('on');
       document.getElementById('ws-btn').textContent = 'Connect';
       document.getElementById('best-score-status').textContent = 'Offline — connect to load best score.';
@@ -230,29 +347,16 @@ function toggleWS() {
         document.getElementById('score-save-status').textContent = 'Connection lost — score pending; reconnect to retry.';
       }
     };
-    ws.onerror = () => ws.close();
-    ws.onmessage = (ev) => {
+    socket.onerror = () => socket.close();
+    socket.onmessage = (ev) => {
+      if (ws !== socket) return;
       try {
         const d = JSON.parse(ev.data);
         receiveHighScore(d);
-        if (d.type === 'sensor') {
-          if (d.pitch !== undefined) S.pIn = clamp(d.pitch, -1, 1);
-          if (d.roll  !== undefined) S.rIn = clamp(d.roll, -1, 1);
-          if (d.yaw   !== undefined) S.yIn = clamp(d.yaw, -1, 1);
-          if (d.joyX  !== undefined) S.camX = clamp(d.joyX, -1, 1);
-          if (d.joyY  !== undefined) S.camY = clamp(d.joyY, -1, 1);
-          if (d.fire) S.fire = true;
-          if (d.pot   !== undefined) S.potThrottle = clamp(d.pot, 0, 1);
-        }
+        if (d && d.type === 'sensor') receiveSensor(d);
       } catch (_) {}
     };
   } catch (_) {}
-}
-
-function sendEvent(event, value) {
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'event', event, value }));
-  }
 }
 
 /* ===== Player physics ===== */
@@ -261,12 +365,8 @@ function updatePlayer() {
   S.cR = lerp(S.cR, S.rIn, C.CTRL_LERP);
   S.cY = lerp(S.cY, S.yIn, C.CTRL_LERP);
 
-  // Throttle: pot overrides keyboard
-  if (S.potThrottle >= 0) {
-    S.targetSpeed = C.MIN_SPD + S.potThrottle * (C.MAX_SPD - C.MIN_SPD);
-  } else {
-    S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
-  }
+  // Throttle: Shift/Ctrl adjust; the MCX encoder level is applied in readInputs().
+  S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
   S.speed = lerp(S.speed, S.targetSpeed, 0.03);
 
   _qP.setFromAxisAngle(_axisX, S.cP * C.PITCH_SPD);
@@ -362,6 +462,8 @@ function updatePlayer() {
     projectiles.push(new Projectile(pR, _fwd.clone()));
 
     S.fireCD = C.FIRE_CD;
+    // One controller button press = one volley.
+    if (controller.pendingFire > 0) controller.pendingFire--;
   }
 }
 
@@ -463,8 +565,7 @@ function spawnWave(waveNum) {
   banner.style.opacity = '1';
   setTimeout(() => { banner.style.opacity = '0'; }, 2000);
 
-  sendEvent('BOOST', 1);
-  setTimeout(() => sendEvent('BOOST', 0), 500);
+  if (waveNum > 1) sendEvent('BONUS', waveNum);
 }
 
 function checkWaveComplete() {
@@ -496,6 +597,31 @@ function addKillMsg(text) {
   setTimeout(() => el.remove(), 2200);
 }
 
+function inputDebugText() {
+  const f = v => (v >= 0 ? '+' : '') + v.toFixed(2);
+  const age = performance.now() - controller.at;
+  let link;
+  if (!ws || ws.readyState !== 1) link = 'disconnected (click Connect)';
+  else if (!Number.isFinite(age) || age > CONTROLLER_STALE_MS) link = 'connected, no sensor data from ESP32';
+  else link = 'connected (' + age.toFixed(0) + ' ms ago)';
+  const live = ws && ws.readyState === 1 && age <= CONTROLLER_STALE_MS;
+  const lines = ['LINK  ' + link];
+  if (live) {
+    lines.push('TILT  ' + (controller.tiltValid
+      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) + ' yaw ' + f(controller.yaw)
+      : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
+    lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
+    lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
+    lines.push('THR   ' + (controller.throttle !== null
+      ? controller.throttle + ' %'
+      : 'none: no $ENC from MCX (keyboard Shift/Ctrl)'));
+  }
+  lines.push('MCX   sent: ' + (lastSentState
+    ? lastSentState.mode + '  lives ' + lastSentState.lives + '  score ' + lastSentState.score
+    : 'nothing yet'));
+  return lines.join('\n');
+}
+
 function updateHUD() {
   document.getElementById('score').textContent = S.score;
   document.getElementById('kills').textContent = S.kills + ' KILL' + (S.kills !== 1 ? 'S' : '');
@@ -513,10 +639,7 @@ function updateHUD() {
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
   document.getElementById('pos-box').textContent = 'POS: ' + Math.round(player.mesh.position.x) + ', ' + Math.round(player.mesh.position.z);
 
-  if (ws && ws.readyState === 1) {
-    const euler = new THREE.Euler().setFromQuaternion(player.mesh.quaternion, 'YXZ');
-    sendEvent('ROLL', Math.round(THREE.MathUtils.radToDeg(euler.z)));
-  }
+  if (showInputs) document.getElementById('input-debug').textContent = inputDebugText();
 }
 
 /* ===== Minimap ===== */
@@ -626,8 +749,8 @@ function gameOver() {
   document.getElementById('final-score').textContent = S.score;
   document.getElementById('final-wave').textContent = S.wave;
   document.getElementById('game-over').style.display = 'flex';
-  sendEvent('SCORE', S.score);
-  // Separate from legacy SCORE telemetry: only this message is a completed run.
+  sendEvent('OVER', S.score);   // MCX game-over feedback
+  // Separate from the MCX event: only this message is a completed, scored run.
   queueFinalScore();
 }
 
@@ -639,7 +762,7 @@ function restartGame() {
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;
   S.fireCD = 0; S.dmgCD = 0; S.over = false; S.running = true;
-  S.fire = false; S.potThrottle = -1;
+  S.fire = false;
   S.camX = 0; S.camY = 0; S.sCamX = 0; S.sCamY = 0;
   S.wave = 1; S.waveEnemiesAlive = 0; S.waveTransition = false; S.waveDelay = 0;
   mouseOrbitH = 0; mouseOrbitV = 0;
@@ -651,6 +774,7 @@ function restartGame() {
 
   initPlayer();
   spawnWave(1);
+  sendEvent('START', 1);
   document.getElementById('game-over').style.display = 'none';
   document.getElementById('hud').style.display = 'block';
   renderer.domElement.requestPointerLock();
@@ -662,7 +786,7 @@ function loop() {
   if (!S.running) return;
   requestAnimationFrame(loop);
 
-  readKeyboard();
+  readInputs();
   updatePlayer();
   S.dmgCD = Math.max(0, S.dmgCD - 1);
 
@@ -695,5 +819,6 @@ document.getElementById('start-screen').addEventListener('click', () => {
   renderer.domElement.requestPointerLock();
   S.running = true;
   spawnWave(1);
+  sendEvent('START', 1);
   loop();
 });

@@ -44,10 +44,13 @@
 #include "FireHold.h"
 
 // Original accelerometer convention: +X -> +pitch, +Y -> +roll.
-// The new estimator uses aerospace pitch (-X), so invert only its output.
+// The estimator uses aerospace pitch (-X), so invert its output.
+// Roll: right edge down gives +rollDeg, but the game's +roll banks LEFT (key A),
+// so invert roll too. Assumes the GY-521 X arrow points forward, components up.
 static TiltConfig originalDirections() {
   TiltConfig config;
   config.pitchSign = -1.0f;
+  config.rollSign = -1.0f;
   return config;
 }
 TiltController tilt(originalDirections());
@@ -73,6 +76,7 @@ TiltController tilt(originalDirections());
  *  *** EDIT THESE BEFORE UPLOADING ***
  * ════════════════════════════════════════════ */
 // Credentials are in the private config.h (copy config.example.h).
+// Local relay instead: WS_USE_SSL 0, WS_HOST = laptop's hotspot IPv4 (ipconfig), WS_PORT 3000.
 #define WS_USE_SSL 1
 const char* WS_HOST = "skystrike-relay.onrender.com";
 const uint16_t WS_PORT = 443;
@@ -329,13 +333,19 @@ static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint3
 
 // Recovery is explicit to avoid repeatedly blocking the loop on broken I2C.
 // Serial: c = recalibrate, r = recenter, i = reinitialize a reconnected MPU.
+// begin() fails when no MPU answers at 0x68 or its WHO_AM_I is unknown.
+static void startTilt() {
+  if (!tilt.begin(Wire, 0x68))
+    Serial.println("[TILT] begin failed: no MPU at 0x68 (check VCC/GND/SDA GPIO8/SCL GPIO9), send i to retry");
+}
+
 static void serviceTilt() {
   tilt.update();
   if (Serial.available()) {
     switch (Serial.read()) {
       case 'c': tilt.startCalibration(); break;
       case 'r': tilt.recenter(); break;
-      case 'i': tilt.begin(Wire, 0x68); break;
+      case 'i': startTilt(); break;
     }
   }
   const TiltStatus status = tilt.status();
@@ -399,7 +409,7 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(400000);
   Wire.setTimeOut(20);
-  tilt.begin(Wire, 0x68);
+  startTilt();
   Serial.println("[TILT] Keep still near level for about 2.25 seconds");
   Serial.println("[TILT] Serial commands: c=calibrate, r=recenter, i=reinitialize");
   firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{

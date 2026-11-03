@@ -2,10 +2,19 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_I2CDevice.h>
 #include <math.h>
+// On the ESP32, use the register-level driver that also accepts clone chips
+// (WHO_AM_I 0x70 etc.); Adafruit_MPU6050::begin() rejects anything but 0x68.
+// Host tests (no ARDUINO macro) keep using their Adafruit_MPU6050 mock.
+#if defined(ARDUINO)
+#include "MpuRegisters.h"
+using TiltSensor = MpuRegisters;
+#else
+#include <Adafruit_MPU6050.h>
+using TiltSensor = Adafruit_MPU6050;
+#endif
 
 // Adafruit edition: this module owns the MPU-6050, not Wi-Fi, Serial, UART, or the other sensors.
 // Call begin() once after Wire.begin(), then call update() frequently in loop().
@@ -432,7 +441,7 @@ class TiltController {
   TiltConfig config_;
   TiltReading reading_;
   TiltStatus state_ = TiltStatus::NotStarted;
-  Adafruit_MPU6050 sensor_;
+  TiltSensor sensor_;
   Adafruit_I2CDevice presenceCheck_{0x68, &Wire};
   bool started_ = false;
   bool filterInitialized_ = false;
