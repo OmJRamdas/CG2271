@@ -72,6 +72,39 @@ int main() {
   tick(tilt);
   near(tilt.latest().yaw, 0);
 
+  // Hold mode: yawHold follows the twist angle, so it stays on while held.
+  // The 1-sample rate pulses above twisted about 0.45 deg each way; re-zero first.
+  tilt.recenterYaw();
+  near(tilt.latest().yawHold, 0);
+  for (int sign : {1, -1}) {
+    mockGyro.gyro.z = sign * 0.785398163f;  // 45 deg/s for 0.5 s = 22.5 deg.
+    tick(tilt, 50);
+    near(tilt.latest().yawDeg, sign * 22.5f, 0.5f);
+    near(tilt.latest().yawHold, sign * 0.5f, 0.02f);
+    mockGyro.gyro.z = 0;
+    tick(tilt, 50);  // Holding still keeps yawing, while the rate output stops.
+    near(tilt.latest().yawHold, sign * 0.5f, 0.02f);
+    near(tilt.latest().yaw, 0);
+    mockGyro.gyro.z = -sign * 0.785398163f;  // Turn back to the front.
+    tick(tilt, 50);
+    mockGyro.gyro.z = 0;
+    tick(tilt);
+    near(tilt.latest().yawHold, 0);
+  }
+  mockGyro.gyro.z = 0.785398163f;  // A 4.5 deg twist is inside the deadzone.
+  tick(tilt, 10);
+  mockGyro.gyro.z = 0;
+  tick(tilt);
+  near(tilt.latest().yawHold, 0, 0.0001f);
+  mockGyro.gyro.z = 0.785398163f;
+  tick(tilt, 50);
+  mockGyro.gyro.z = 0;
+  tick(tilt);
+  assert(tilt.latest().yawHold > 0.4f);
+  tilt.recenterYaw();  // The game's START event re-zeroes yaw only.
+  near(tilt.latest().yawHold, 0, 0.0001f);
+  near(tilt.latest().pitch, 0);
+
   mockAcceleration.acceleration.y = 9.80665f * 0.5f;
   mockAcceleration.acceleration.z = 9.80665f * sqrtf(0.75f);
   tick(tilt, 200);
@@ -91,7 +124,7 @@ int main() {
   mockPresent = false;
   tick(tilt);
   assert(tilt.status() == TiltStatus::Fault);
-  assert(!tilt.latest().valid && tilt.latest().yaw == 0);
+  assert(!tilt.latest().valid && tilt.latest().yaw == 0 && tilt.latest().yawHold == 0);
   mockPresent = true;
   tick(tilt);
   assert(!tilt.latest().valid);  // Reconnection requires explicit begin.
@@ -117,5 +150,5 @@ int main() {
   assert(wrapping.count() == 1);
   wrapping.edge(0x30U);
   assert(wrapping.count() == 2);
-  puts("Tilt directions, calibration, staleness, faults, recenter and button tests passed");
+  puts("Tilt directions, yaw hold, calibration, staleness, faults, recenter and button tests passed");
 }
