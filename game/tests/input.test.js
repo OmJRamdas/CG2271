@@ -37,6 +37,7 @@ function game() {
     if (!elements.has(id)) elements.set(id, {
       style: {}, classList: { add() {}, remove() {} }, addEventListener() {},
       getContext() { return {}; },  // minimap canvas, created when game.js loads
+      appendChild() {},             // killfeed messages
     });
     return elements.get(id);
   };
@@ -47,7 +48,10 @@ function game() {
       CylinderGeometry: class { rotateX() {} }, MeshBasicMaterial: class {},
     },
     renderer: { domElement: { setAttribute() {}, style: {}, addEventListener() {} } },
-    document: { addEventListener() {}, getElementById: element },
+    document: {
+      addEventListener() {}, getElementById: element,
+      createElement: () => ({ remove() {} }),
+    },
     addEventListener() {}, innerWidth: 1000, innerHeight: 700,
     performance: { now: () => now },
     setInterval: fn => timers.push(fn), setTimeout() {}, requestAnimationFrame() {},
@@ -86,6 +90,26 @@ test('controller axes persist across frames and preserve every sign', () => {
     assert.equal(g.run('S.camX'), -0.3);
     assert.equal(g.run('S.camY'), 0.7);
   }
+});
+
+test('Y switches yaw between turning rate and held twist', () => {
+  const g = game();
+  g.packet({ yaw: 0.2, yawHold: 0.8 });
+  g.run('readInputs()');
+  assert.equal(g.run('yawMode'), 'rate');
+  assert.equal(g.run('S.yIn'), 0.2);
+  g.run('toggleYawMode(); readInputs()');
+  assert.equal(g.run('yawMode'), 'hold');
+  assert.equal(g.run('S.yIn'), 0.8);
+  g.packet({ yaw: 0.2, yawHold: 0.8, tiltValid: false });
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), 0);
+  g.packet({});  // Older firmware without yawHold: packet accepted, no hold yaw.
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), 0);
+  assert.equal(g.run('S.pIn'), 0.4);
+  g.run('toggleYawMode(); readInputs()');
+  assert.equal(g.run('S.yIn'), 0.2);
 });
 
 test('stale/disconnected controller falls back to original keyboard controls', () => {

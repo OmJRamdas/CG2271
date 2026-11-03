@@ -120,6 +120,7 @@ document.addEventListener('keydown', e => {
     showInputs = !showInputs;
     document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
   }
+  if (e.code === 'KeyY' && !e.repeat) toggleYawMode();
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -157,7 +158,7 @@ function readKeyboard() {
 /* ===== Controller input ===== */
 const CONTROLLER_STALE_MS = 300;
 const controller = {
-  at: -Infinity, pitch: 0, roll: 0, yaw: 0, joyX: 0, joyY: 0,
+  at: -Infinity, pitch: 0, roll: 0, yaw: 0, yawHold: 0, joyX: 0, joyY: 0,
   pendingFire: 0, fireSession: null, fireCount: 0,
   ldrValid: false, dark: false, ldrRaw: 0,
   fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
@@ -165,6 +166,16 @@ const controller = {
 // Press I during a game to show what the hardware controller is sending.
 let showInputs = false;
 let lastSentState = null;
+// Press Y to compare yaw styles. 'rate': yaw while the controller is turning
+// (original). 'hold': keep yawing while it stays twisted away from the front.
+let yawMode = 'rate';
+try { if (localStorage.getItem('yawMode') === 'hold') yawMode = 'hold'; } catch (e) {}
+
+function toggleYawMode() {
+  yawMode = yawMode === 'hold' ? 'rate' : 'hold';
+  try { localStorage.setItem('yawMode', yawMode); } catch (e) {}
+  addKillMsg('YAW MODE: ' + yawMode.toUpperCase());
+}
 
 function clearController() {
   controller.at = -Infinity;
@@ -184,8 +195,12 @@ function receiveSensor(d) {
   if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
   controller.at = performance.now();
   for (const key of axes) controller[key] = clamp(d[key], -1, 1);
+  // Optional: firmware without hold-mode yaw leaves it at 0.
+  controller.yawHold = Number.isFinite(d.yawHold) ? clamp(d.yawHold, -1, 1) : 0;
   controller.tiltValid = d.tiltValid !== false;
-  if (!controller.tiltValid) controller.pitch = controller.roll = controller.yaw = 0;
+  if (!controller.tiltValid) {
+    controller.pitch = controller.roll = controller.yaw = controller.yawHold = 0;
+  }
   controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
     d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
   controller.dark = controller.ldrValid && d.dark;
@@ -223,7 +238,7 @@ function readInputs() {
   }
   S.pIn = controller.pitch;
   S.rIn = controller.roll;
-  S.yIn = controller.yaw;
+  S.yIn = yawMode === 'hold' ? controller.yawHold : controller.yaw;
   S.camX = controller.joyX;
   S.camY = controller.joyY;
   S.stealth = controller.ldrValid && controller.dark;
@@ -608,8 +623,10 @@ function inputDebugText() {
   const lines = ['LINK  ' + link];
   if (live) {
     lines.push('TILT  ' + (controller.tiltValid
-      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) + ' yaw ' + f(controller.yaw)
+      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) +
+        ' yaw ' + f(controller.yaw) + ' (rate)  hold ' + f(controller.yawHold)
       : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
+    lines.push('YAW   mode ' + yawMode.toUpperCase() + ' (press Y)');
     lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
     lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
     lines.push('THR   ' + (controller.throttle !== null
