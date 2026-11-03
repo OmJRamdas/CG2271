@@ -28,6 +28,7 @@ function game() {
       this.position = new Vector(0, 80, 0);
       this.quaternion = new Quaternion();
       this.userData = { prop: { rotation: { z: 0 } }, navigationLights: [] };
+      this.children = [];  // the rewritten updatePlayer() walks the mesh's children
     }
     lookAt() {}
   }
@@ -35,6 +36,7 @@ function game() {
   const element = id => {
     if (!elements.has(id)) elements.set(id, {
       style: {}, classList: { add() {}, remove() {} }, addEventListener() {},
+      getContext() { return {}; },  // minimap canvas, created when game.js loads
     });
     return elements.get(id);
   };
@@ -68,6 +70,9 @@ function game() {
     time: ms => { now = ms; }, packets, timers, element,
   };
 }
+
+// The game fires three guns (nose + two wings) per volley.
+const GUNS = 3;
 
 test('controller axes persist across frames and preserve every sign', () => {
   const g = game();
@@ -117,11 +122,11 @@ test('presses survive false packets, render delays and weapon cooldown exactly o
   assert.equal(g.run('controller.pendingFire'), 2);
   assert.equal(g.run('projectiles.length'), 0);
   g.run('for (let i = 0; i < 20; i++) { readInputs(); updatePlayer(); }');
-  assert.equal(g.run('projectiles.length'), 2);
+  assert.equal(g.run('projectiles.length'), 2 * GUNS);
   assert.equal(g.run('controller.pendingFire'), 0);
   g.packet({ fire: true, fireCount: 2, firePending: 2 }); // Duplicate cannot refire.
   g.run('for (let i = 0; i < 20; i++) { readInputs(); updatePlayer(); }');
-  assert.equal(g.run('projectiles.length'), 2);
+  assert.equal(g.run('projectiles.length'), 2 * GUNS);
   g.packet({ fireCount: 4 }); // Recover two presses from skipped sensor packets.
   assert.equal(g.run('controller.pendingFire'), 2);
 });
@@ -142,7 +147,7 @@ test('button counter rollover, restart and repeated packets do not invent shots'
 test('held Space retains original repeated firing, independent of controller presses', () => {
   const g = game();
   g.run("keys.Space = true; for (let i = 0; i < 21; i++) { readInputs(); updatePlayer(); }");
-  assert.equal(g.run('projectiles.length'), 3);
+  assert.equal(g.run('projectiles.length'), 3 * GUNS);
 });
 
 test('malformed axes do not refresh timeout and stale LDR cannot hold stealth', () => {

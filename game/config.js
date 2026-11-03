@@ -49,7 +49,6 @@ const C = {
 const S = {
   score: 0, kills: 0, health: 100, speed: 0.6, targetSpeed: 0.6,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
-  potThrottle: -1,          // -1 = pot not connected; 0..1 from MCX
   camX: 0, camY: 0,        // raw joystick / mouse camera input
   sCamX: 0, sCamY: 0,      // smoothed camera orbit
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
