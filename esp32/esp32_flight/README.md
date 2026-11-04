@@ -47,6 +47,21 @@ ESP32 client at a time.
 
 ## Required bench checks
 
+The S2 cannot reliably hold relay WSS and Firebase HTTPS TLS allocations at the
+same time. Before a Firebase batch, the worker requests exclusive TLS access;
+the main loop disconnects the relay and acknowledges it before HTTPS starts.
+Sensor/UART polling continues, but browser input transmission pauses. After
+the batch, automatic relay reconnect resumes and queued results are delivered.
+Readiness is announced once rather than on every reconnect to avoid a lookup
+loop. Failed requests retain the existing ten-second retry policy. Prefer
+database operations on the start/game-over screens. Browser game_state PLAY
+defers all new Firebase batches, including retries and token renewal, until
+IDLE or OVER arrives. The last PLAY state is retained across disconnects.
+A database batch already in progress cannot be cancelled if the player starts
+while the relay is paused. Wait for the best-score response before starting.
+The normal MCX link watchdog
+still applies during these pauses.
+
 Compile success does not prove hardware timing. On the S2 verify calibration,
 100 Hz sample freshness, 20 Hz transmission, quick/held fire, encoder telemetry,
 UART ACK/NAK and actuator feedback while a score is being saved. Repeat with

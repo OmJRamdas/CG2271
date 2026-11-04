@@ -266,7 +266,8 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       wsConnected = true;
       Serial.println("[WS] Connected to relay");
       webSocket.sendTXT("{\"type\":\"identify\",\"role\":\"esp32\"}");
-      if (firebaseAvailable) webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
+      // Worker announces readiness once; repeating it after an intentional
+      // TLS pause would trigger another lookup and another disconnect.
       break;
 
     case WStype_DISCONNECTED:
@@ -297,6 +298,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
                          doc["mode"].as<const char *>())) {
           cloudStateAt = millis();
           hasCloudState = true;
+          FirebaseWorker::setPlaying(!strcmp(doc["mode"].as<const char *>(), "PLAY"));
         }
       } else if (!strcmp(kind, "event") && hasCloudState &&
                  uint32_t(millis() - cloudStateAt) <= CLOUD_STALE_MS) {
@@ -426,7 +428,7 @@ void setup() {
 void loop() {
   serviceTilt();  // Poll frequently; TiltController schedules samples at 100 Hz.
   serviceWiFi(millis());
-  if (WiFi.status() == WL_CONNECTED) webSocket.loop();
+  FirebaseWorker::serviceRelay(webSocket);
   readUART();
   const uint32_t now = millis();
   serviceMCX(now);
