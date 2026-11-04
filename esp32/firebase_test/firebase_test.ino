@@ -45,8 +45,8 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       Serial.println("[WS] Connected to Render");
       webSocket.sendTXT("{\"type\":\"identify\",\"role\":\"esp32\"}");
-      // Notify browser to retry without reading any worker-owned state.
-      webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
+      // The worker queues the initial readiness announcement. Do not trigger
+      // another database lookup every time a Firebase TLS pause ends.
       break;
     case WStype_DISCONNECTED:
       Serial.println("[WS] Disconnected");
@@ -56,7 +56,11 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       JsonDocument message;
       if (deserializeJson(message, payload, length)) break;
       const char *kind = message["type"] | "";
-      if (!strcmp(kind, "get_high_score")) {
+      if (!strcmp(kind, "game_state")) {
+        const char *mode = message["mode"] | "";
+        if (!strcmp(mode, "PLAY") || !strcmp(mode, "IDLE") || !strcmp(mode, "OVER"))
+          FirebaseWorker::setPlaying(!strcmp(mode, "PLAY"));
+      } else if (!strcmp(kind, "get_high_score")) {
         FirebaseWorker::requestBest(message["requestId"] | "");
       } else if (!strcmp(kind, "submit_score") && message["score"].is<int>()) {
         if (!FirebaseWorker::submit(message["runId"] | "", message["score"].as<int>())) {
@@ -104,8 +108,8 @@ void loop() {
     Serial.println("[WIFI] Retrying hotspot connection...");
     WiFi.reconnect();
   }
+  FirebaseWorker::serviceRelay(webSocket);
   if (connected) {
-    webSocket.loop();
     serviceReplies();
   }
   delay(1);

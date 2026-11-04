@@ -6,9 +6,11 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/event_groups.h>
 #include "GoogleRoots.h"
 
 // Only the worker task touches HTTP, tokens, pending jobs and completed results.
@@ -38,6 +40,47 @@ struct PendingScore {
 struct ReadRequest { char id[65]; };
 
 static QueueHandle_t inbox = nullptr, reads = nullptr, outbox = nullptr;
+static EventGroupHandle_t tlsGate = nullptr;
+static constexpr EventBits_t TLS_REQUESTED = 1, RELAY_RELEASED = 2, GAME_PLAYING = 4;
+
+static void setPlaying(bool playing) {
+  if (!tlsGate) return;
+  if (playing) xEventGroupSetBits(tlsGate, GAME_PLAYING);
+  else xEventGroupClearBits(tlsGate, GAME_PLAYING);
+}
+
+// Called ONLY from loop(), which owns the WebSocket client. The worker waits
+// for acknowledgement that disconnect() has freed the relay TLS allocation.
+template <typename Relay> static void serviceRelay(Relay &relay) {
+  if (tlsGate && (xEventGroupGetBits(tlsGate) & TLS_REQUESTED)) {
+    if (!(xEventGroupGetBits(tlsGate) & RELAY_RELEASED)) {
+      // Recheck in the WebSocket owner: PLAY may arrive after the worker asks.
+      if (xEventGroupGetBits(tlsGate) & GAME_PLAYING) {
+        if (WiFi.status() == WL_CONNECTED) relay.loop();
+        return;
+      }
+      Serial.println("[TLS] Pausing relay for Firebase.");
+      relay.disconnect();
+      xEventGroupSetBits(tlsGate, RELAY_RELEASED);
+    }
+    return;  // Also suppress the client's automatic reconnect attempts.
+  }
+  if (tlsGate && (xEventGroupGetBits(tlsGate) & RELAY_RELEASED)) {
+    xEventGroupClearBits(tlsGate, RELAY_RELEASED);
+    Serial.println("[TLS] Firebase finished; relay may reconnect.");
+  }
+  if (WiFi.status() == WL_CONNECTED) relay.loop();
+}
+
+static bool acquireTLS() {
+  xEventGroupClearBits(tlsGate, RELAY_RELEASED);
+  xEventGroupSetBits(tlsGate, TLS_REQUESTED);
+  if (xEventGroupWaitBits(tlsGate, RELAY_RELEASED, pdFALSE, pdTRUE,
+                         pdMS_TO_TICKS(15000)) & RELAY_RELEASED) return true;
+  xEventGroupClearBits(tlsGate, TLS_REQUESTED);
+  Serial.println("[TLS] Relay pause timed out; Firebase will retry.");
+  return false;
+}
 static bool finished = false, attempted = false;
 static uint32_t lastAttemptAt = 0, authenticatedAt = 0;
 static String idToken;
@@ -48,9 +91,6 @@ static unsigned scoreHead = 0, scoreCount = 0;
 static unsigned completedCount = 0, completedNext = 0;
 static char pendingReadId[65] = "";
 static int cachedHighScore = 0;
-// The S2 cannot hold two TLS handshakes at once ("SSL - Memory allocation failed").
-// A sketch with its own TLS WebSocket blocks HTTPS until that socket is connected.
-static volatile bool connectionsAllowed = true;
 
 static bool validId(const char *id) {
   const size_t length = strlen(id);
@@ -84,8 +124,6 @@ static bool receive(Reply &reply) {
   return outbox && xQueueReceive(outbox, &reply, 0) == pdTRUE;
 }
 
-static void allowConnections(bool allowed) { connectionsAllowed = allowed; }
-
 static bool sendScoreResult(const PendingScore &job) {
   Reply reply = {};
   reply.type = ReplyType::Score;
@@ -105,6 +143,8 @@ static int request(const String &url, const char *method,
   WiFiClientSecure tls;
   tls.setCACert(GOOGLE_ROOTS);
   tls.setHandshakeTimeout(10);
+  const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   HTTPClient http;
   http.setConnectTimeout(10000);
   http.setTimeout(10000);
@@ -121,8 +161,16 @@ static int request(const String &url, const char *method,
   else if (!strcmp(method, "PUT")) code = http.PUT(body);
   else code = http.POST(body);
   if (code < 0) {
-    Serial.printf("[TLS] Connection failed; free heap %u, largest block %u bytes\n",
-                  unsigned(ESP.getFreeHeap()), unsigned(ESP.getMaxAllocHeap()));
+    char tlsMessage[192] = {};
+    const int tlsCode = tls.lastError(tlsMessage, sizeof(tlsMessage));
+    // Deliberately omit URLs and response bodies: they can contain tokens.
+    Serial.printf("[HTTPS] %s failed: HTTP=%d, TLS=%d (%s)\n",
+                  method, code, tlsCode, tlsMessage);
+    Serial.printf("[HTTPS] Internal RAM before: free=%u, largest=%u; now free=%u, largest=%u; WiFi=%d, RSSI=%d\n",
+                  (unsigned)freeBefore, (unsigned)largestBefore,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (int)WiFi.status(), (int)WiFi.RSSI());
   }
   response = code > 0 ? http.getString() : "";
   if (etag) *etag = http.header("ETag");
@@ -306,13 +354,19 @@ static void taskMain(void *) {
   bool waitingForTimeLogged = false;
   for (;;) {
     acceptCommands();
+    // Keep the last reported PLAY state across relay outages. A disconnect
+    // must not accidentally authorize a database operation during gameplay.
+    if (xEventGroupGetBits(tlsGate) & GAME_PLAYING) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
     const uint32_t now = millis();
     if (finished && uint32_t(now - authenticatedAt) >= 50UL * 60UL * 1000UL) {
       finished = false;
       attempted = false;
       idToken = "";
     }
-    if (WiFi.status() == WL_CONNECTED && connectionsAllowed) {
+    if (WiFi.status() == WL_CONNECTED) {
       if (time(nullptr) < 1767225600) {
         if (!waitingForTimeLogged) {
           Serial.println("[TIME] Waiting for network time; WebSocket handling continues.");
@@ -320,6 +374,15 @@ static void taskMain(void *) {
         }
         // Don't start a retry timer here: authenticate as soon as time is ready.
       } else {
+        const bool authDue = !finished && (!attempted || uint32_t(now - lastAttemptAt) >= 10000);
+        const bool scoreDue = finished && scoreCount &&
+            (!saveAttempted || uint32_t(now - lastSaveAttemptAt) >= 10000);
+        const bool readDue = finished && pendingReadId[0] &&
+            (!readAttempted || uint32_t(now - lastReadAttemptAt) >= 10000);
+        if (!(authDue || scoreDue || readDue) || !acquireTLS()) {
+          vTaskDelay(pdMS_TO_TICKS(100));
+          continue;
+        }
         if (!finished && (!attempted || uint32_t(now - lastAttemptAt) >= 10000)) {
           attempted = true;
           finished = authenticate();
@@ -347,6 +410,7 @@ static void taskMain(void *) {
           lastReadAttemptAt = millis();
           readAttempted = true;
         }
+        xEventGroupClearBits(tlsGate, TLS_REQUESTED);
       }
     }
     // Works on the single-core S2 too: no task is pinned to a particular core.
@@ -356,15 +420,18 @@ static void taskMain(void *) {
 
 static bool begin(const Config &config) {
   settings = config;
+  tlsGate = xEventGroupCreate();
   inbox = xQueueCreate(8, sizeof(PendingScore));
   reads = xQueueCreate(1, sizeof(ReadRequest));
   outbox = xQueueCreate(12, sizeof(Reply));
   // ESP-IDF stack sizes are bytes. TLS/JSON require a larger task stack.
-  if (inbox && reads && outbox &&
+  if (tlsGate && inbox && reads && outbox &&
       xTaskCreate(taskMain, "firebase", 16384, nullptr, 1, nullptr) == pdPASS) return true;
   if (inbox) vQueueDelete(inbox);
   if (reads) vQueueDelete(reads);
   if (outbox) vQueueDelete(outbox);
+  if (tlsGate) vEventGroupDelete(tlsGate);
+  tlsGate = nullptr;
   inbox = reads = outbox = nullptr;
   return false;
 }
