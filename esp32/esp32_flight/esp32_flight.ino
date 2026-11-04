@@ -9,10 +9,9 @@
  *   MPU-6050 (I2C)  → pitch, roll, yaw   (flight control)
  *   Joystick (ADC)  → camera X / Y       (camera orbit)
  *   Push button     → fire               (GPIO interrupt)
- * Rotary encoder (throttle) is on the MCXC444; it arrives here as $ENC.
  *
- * MCXC444 sends: $ENC / $ACK / $NAK (see mcx/source/protocol.h).
- * We send: $GS state heartbeats and $EV one-shot game events.
+ * MCXC444 sends:  SENSOR:POT,<0..4095>\n   (potentiometer)
+ * We forward:     GAME:<event>,<value>\n    (game events)
  *
  * UART wiring identical to Assignment 3:
  *   ESP32 GPIO1 TX  →  MCX PTE23 UART2 RX
@@ -21,8 +20,6 @@
  *
  * Required libraries (install via Arduino Library Manager):
  *   - WebSockets by Markus Sattler  (arduinoWebSockets)
- *   - Adafruit MPU6050, Adafruit Unified Sensor, Adafruit BusIO
- *   - ArduinoJson 7
  *   - (Wire.h is built-in)
  *
  * Board:  ESP32S2 Dev Module
@@ -33,27 +30,7 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
-#include <ArduinoJson.h>
-#include <esp_random.h>
-#include <time.h>
-#include "config.h"
-#include "FirebaseWorker.h"
-#include "McxLink.h"
-#include "ButtonEvents.h"
-#include "TiltController.h"
-#include "FireHold.h"
-
-// Original accelerometer convention: +X -> +pitch, +Y -> +roll.
-// The estimator uses aerospace pitch (-X), so invert its output.
-// Roll: right edge down gives +rollDeg, but the game's +roll banks LEFT (key A),
-// so invert roll too. Assumes the GY-521 X arrow points forward, components up.
-static TiltConfig originalDirections() {
-  TiltConfig config;
-  config.pitchSign = -1.0f;
-  config.rollSign = -1.0f;
-  return config;
-}
-TiltController tilt(originalDirections());
+#include <math.h>
 
 #if !defined(CONFIG_IDF_TARGET_ESP32S2)
 #error "Select 'ESP32S2 Dev Module' in Arduino IDE."
@@ -64,7 +41,6 @@ TiltController tilt(originalDirections());
  * ════════════════════════════════════════════ */
 #define UART_TX_PIN   1    // Serial1 TX → MCX RX
 #define UART_RX_PIN   2    // Serial1 RX ← MCX TX
-#define USE_JOYSTICK  1    // encoder moved to the MCXC444, so GPIO5 is the joystick's again
 #define JOY_X_PIN     3    // Joystick X axis (ADC)
 #define JOY_Y_PIN     5    // Joystick Y axis (ADC)
 #define BTN_PIN       7    // Fire button (active LOW, internal pull-up)
@@ -75,56 +51,177 @@ TiltController tilt(originalDirections());
  *  WIFI & WEBSOCKET CONFIG
  *  *** EDIT THESE BEFORE UPLOADING ***
  * ════════════════════════════════════════════ */
-// Credentials are in the private config.h (copy config.example.h).
-// Local relay instead: WS_USE_SSL 0, WS_HOST = laptop's hotspot IPv4 (ipconfig), WS_PORT 3000.
-#define WS_USE_SSL 1
-const char* WS_HOST = "skystrike-relay.onrender.com";
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* WS_HOST   = "your-relay.glitch.me";  // e.g. "cg2271-relay.glitch.me"
 const uint16_t WS_PORT = 443;
-const char* WS_PATH = "/";
+const char* WS_PATH    = "/";
+
+/* ════════════════════════════════════════════
+ *  MPU-6050 REGISTERS
+ * ════════════════════════════════════════════ */
+#define MPU_ADDR       0x68
+#define REG_PWR_MGMT_1 0x6B
+#define REG_ACCEL_CFG  0x1C
+#define REG_GYRO_CFG   0x1B
+#define REG_ACCEL_XOUT 0x3B   // 6 bytes: AX_H, AX_L, AY_H, AY_L, AZ_H, AZ_L
+#define REG_GYRO_XOUT  0x43   // 6 bytes: GX_H, GX_L, GY_H, GY_L, GZ_H, GZ_L
+
+// Sensitivity at default ±2g / ±250 deg/s
+#define ACCEL_SCALE  16384.0f
+#define GYRO_SCALE   131.0f
 
 /* ════════════════════════════════════════════
  *  TUNING CONSTANTS
  * ════════════════════════════════════════════ */
 #define SEND_INTERVAL_MS    50     // 20 Hz sensor updates to game
+#define CALIB_SAMPLES       200    // gyro calibration at startup
+#define COMP_ALPHA          0.96f  // complementary filter weight (gyro trust)
+#define PITCH_MAX_DEG       45.0f  // tilt range mapped to ±1
+#define ROLL_MAX_DEG        45.0f
+#define PITCH_DEADZONE_DEG  10.0f  // ignore tilts under this (degrees)
+#define ROLL_DEADZONE_DEG   10.0f
+#define YAW_RATE_MAX_DPS    90.0f  // gyro-Z rate mapped to ±1
 #define JOY_DEADZONE        80     // ADC units from center
-#define CLOUD_STALE_MS      1500
-#define ENC_STALE_MS        1500   // MCX sends $ENC at least every 500 ms
+#define BTN_DEBOUNCE_MS     50
 
 /* ════════════════════════════════════════════
  *  GLOBAL STATE
  * ════════════════════════════════════════════ */
 WebSocketsClient webSocket;
 bool wsConnected = false;
-bool firebaseAvailable = false;
-bool wifiWasConnected = false;
-uint32_t lastWifiRetryAt = 0;
-FirebaseWorker::Reply pendingFirebaseReply;
-bool hasPendingFirebaseReply = false;
+
+// MPU-6050 calibration
+float gxOffset = 0.0f, gyOffset = 0.0f, gzOffset = 0.0f;
+
+// Complementary filter state
+float filtPitch = 0.0f, filtRoll = 0.0f;
+unsigned long lastMPUMicros = 0;
 
 // Joystick calibration (read at startup)
 int joyXCenter = 2048, joyYCenter = 2048;
 
-// Count accepted falling edges atomically; never clear a press before sending.
-ButtonEvents button;
-portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
-uint32_t fireSession = 0, lastSentFireCount = 0;
+// Button (interrupt-driven)
+volatile bool btnFlag = false;
+unsigned long lastBtnTime = 0;
 
-// Debounced held-fire level. (Throttle comes from the MCX encoder via $ENC.)
-FireHold fireHold;
-int lastPrintedThrottle = -1;
-bool lastPrintedHeld = false;
-uint32_t lastPrintedPresses = 0;
+// Potentiometer from MCX via UART
+float potValue = -1.0f;   // -1 = not yet received
 
-McxLink mcx;
-char uartBuf[McxLink::MAX_LINE + 1];
+// UART receive buffer
+char uartBuf[64];
 uint8_t uartPos = 0;
-bool uartDiscard = false;
-bool hasCloudState = false;
-uint32_t cloudStateAt = 0;
-unsigned long lastSendTime = 0;
-TiltStatus lastTiltStatus = TiltStatus::NotStarted;
 
-// Joystick X steers yaw in the game; axes, signs and deadzone are unchanged.
+// Sensor send timing
+unsigned long lastSendTime = 0;
+
+/* ════════════════════════════════════════════
+ *  MPU-6050 I2C HELPERS
+ * ════════════════════════════════════════════ */
+static void mpuWrite(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+static void mpuRead(uint8_t reg, uint8_t *buf, uint8_t len) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, len);
+  for (uint8_t i = 0; i < len && Wire.available(); i++) {
+    buf[i] = Wire.read();
+  }
+}
+
+static int16_t combine(uint8_t h, uint8_t l) {
+  return (int16_t)((h << 8) | l);
+}
+
+/* ════════════════════════════════════════════
+ *  MPU-6050 INIT & CALIBRATION
+ * ════════════════════════════════════════════ */
+static void initMPU() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);  // 400 kHz fast-mode
+  delay(100);
+
+  // Wake up (clear sleep bit)
+  mpuWrite(REG_PWR_MGMT_1, 0x00);
+  delay(100);
+
+  // ±2g accel, ±250 deg/s gyro (defaults, explicit for clarity)
+  mpuWrite(REG_ACCEL_CFG, 0x00);
+  mpuWrite(REG_GYRO_CFG,  0x00);
+  delay(50);
+
+  Serial.println("[MPU] Calibrating gyroscope — keep the board still…");
+  float gxSum = 0, gySum = 0, gzSum = 0;
+  for (int i = 0; i < CALIB_SAMPLES; i++) {
+    uint8_t buf[6];
+    mpuRead(REG_GYRO_XOUT, buf, 6);
+    gxSum += combine(buf[0], buf[1]) / GYRO_SCALE;
+    gySum += combine(buf[2], buf[3]) / GYRO_SCALE;
+    gzSum += combine(buf[4], buf[5]) / GYRO_SCALE;
+    delay(5);
+  }
+  gxOffset = gxSum / CALIB_SAMPLES;
+  gyOffset = gySum / CALIB_SAMPLES;
+  gzOffset = gzSum / CALIB_SAMPLES;
+  Serial.printf("[MPU] Gyro offsets: %.2f, %.2f, %.2f deg/s\n", gxOffset, gyOffset, gzOffset);
+}
+
+/* ════════════════════════════════════════════
+ *  READ MPU-6050 & COMPLEMENTARY FILTER
+ * ════════════════════════════════════════════ */
+struct SensorData {
+  float pitch;   // -1..1
+  float roll;    // -1..1
+  float yaw;     // -1..1 (rate, not angle)
+};
+
+static SensorData readMPU() {
+  SensorData out = {0, 0, 0};
+
+  // Read accel + gyro (14 bytes: accel[6] + temp[2] + gyro[6])
+  uint8_t buf[14];
+  mpuRead(REG_ACCEL_XOUT, buf, 14);
+
+  float ax = combine(buf[0],  buf[1])  / ACCEL_SCALE;
+  float ay = combine(buf[2],  buf[3])  / ACCEL_SCALE;
+  float az = combine(buf[4],  buf[5])  / ACCEL_SCALE;
+  // buf[6..7] = temperature (skip)
+  float gx = combine(buf[8],  buf[9])  / GYRO_SCALE - gxOffset;
+  float gy = combine(buf[10], buf[11]) / GYRO_SCALE - gyOffset;
+  float gz = combine(buf[12], buf[13]) / GYRO_SCALE - gzOffset;
+
+  // Time delta
+  unsigned long now = micros();
+  float dt = (now - lastMPUMicros) / 1000000.0f;
+  if (dt <= 0 || dt > 0.5f) dt = 0.02f;   // sanity clamp
+  lastMPUMicros = now;
+
+  // Accelerometer angles (degrees)
+  float accPitch = atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / M_PI;
+  float accRoll  = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / M_PI;
+
+  // Complementary filter: trust gyro short-term, accel long-term
+  filtPitch = COMP_ALPHA * (filtPitch + gx * dt) + (1.0f - COMP_ALPHA) * accPitch;
+  filtRoll  = COMP_ALPHA * (filtRoll  + gy * dt) + (1.0f - COMP_ALPHA) * accRoll;
+
+  // Map to -1..1 for game
+  out.pitch = constrain(filtPitch / PITCH_MAX_DEG, -1.0f, 1.0f);
+  out.roll  = constrain(filtRoll  / ROLL_MAX_DEG,  -1.0f, 1.0f);
+  // Yaw: use gyro Z rate directly (rotate controller to yaw)
+  out.yaw   = constrain(gz / YAW_RATE_MAX_DPS, -1.0f, 1.0f);
+
+  return out;
+}
+
+/* ════════════════════════════════════════════
+ *  JOYSTICK
+ * ════════════════════════════════════════════ */
 static void calibrateJoystick() {
   long sumX = 0, sumY = 0;
   for (int i = 0; i < 30; i++) {
@@ -154,162 +251,100 @@ static void readJoystick(float &jx, float &jy) {
  *  BUTTON (interrupt)
  * ════════════════════════════════════════════ */
 void IRAM_ATTR buttonISR() {
-  portENTER_CRITICAL_ISR(&buttonMux);
-  button.edge(millis());
-  portEXIT_CRITICAL_ISR(&buttonMux);
+  btnFlag = true;
 }
 
-static uint32_t buttonCount() {
-  portENTER_CRITICAL(&buttonMux);
-  const uint32_t count = button.count();
-  portEXIT_CRITICAL(&buttonMux);
-  return count;
-}
-
-/* ════════════════════════════════════════════
- *  THROTTLE (rotary encoder on the MCXC444, received as $ENC)
- * ════════════════════════════════════════════ */
-// 0..100 while the MCX reading is fresh; -1 otherwise, which the game treats
-// as "no controller throttle" and falls back to Shift/Ctrl.
-static int throttleLevel(uint32_t now) {
-  if (!mcx.hasEnc || uint32_t(now - mcx.encAt) > ENC_STALE_MS) return -1;
-  return static_cast<int>(mcx.encLevel);
+static bool readButton() {
+  if (btnFlag) {
+    unsigned long now = millis();
+    if (now - lastBtnTime >= BTN_DEBOUNCE_MS) {
+      lastBtnTime = now;
+      btnFlag = false;
+      return true;
+    }
+    btnFlag = false;
+  }
+  return false;
 }
 
 /* ════════════════════════════════════════════
  *  UART TO/FROM MCXC444
  * ════════════════════════════════════════════ */
 
+// Parse incoming: SENSOR:POT,<value>
+static void processUARTLine(const char *line) {
+  // Expected: "SENSOR:POT,<0..4095>"
+  if (strncmp(line, "SENSOR:POT,", 11) == 0) {
+    int raw = atoi(line + 11);
+    potValue = constrain((float)raw / 4095.0f, 0.0f, 1.0f);
+  }
+}
+
 static void readUART() {
   while (Serial1.available()) {
-    const char c = static_cast<char>(Serial1.read());
+    char c = (char)Serial1.read();
     if (c == '\n') {
-      if (!uartDiscard && uartPos) {
+      if (uartPos > 0) {
         uartBuf[uartPos] = '\0';
-        mcx.receive(uartBuf, millis());
+        processUARTLine(uartBuf);
+        uartPos = 0;
       }
-      uartPos = 0;
-      uartDiscard = false;
-    } else if (c != '\r' && !uartDiscard) {
-      if (uartPos < sizeof(uartBuf) - 1) uartBuf[uartPos++] = c;
-      else uartDiscard = true;  // Discard the entire oversized line.
+    } else if (c != '\r') {
+      if (uartPos < sizeof(uartBuf) - 1) {
+        uartBuf[uartPos++] = c;
+      } else {
+        uartPos = 0;   // overflow → discard
+      }
     }
   }
 }
 
-static void serviceMCX(uint32_t now) {
-  if (!wsConnected || !hasCloudState || uint32_t(now - cloudStateAt) > CLOUD_STALE_MS) {
-    mcx.suspend();  // Let the MCX watchdog expose a lost cloud/browser link.
-    return;
-  }
-  if (Serial1.availableForWrite() >= static_cast<int>(McxLink::MAX_LINE + 1)) {
-    const char *frame = mcx.nextFrame(now);
-    if (frame) Serial1.print(frame);
-  }
+// Forward game events to MCX: GAME:<event>,<value>\n
+static void forwardToMCX(const char *event, int value) {
+  Serial1.printf("GAME:%s,%d\n", event, value);
 }
 
 /* ════════════════════════════════════════════
  *  WEBSOCKET
  * ════════════════════════════════════════════ */
-static void serviceWiFi(uint32_t now) {
-  const bool connected = WiFi.status() == WL_CONNECTED;
-  if (connected != wifiWasConnected) {
-    wifiWasConnected = connected;
-    if (connected) {
-      Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-      configTime(0, 0, "time.google.com", "pool.ntp.org");
-    } else {
-      wsConnected = false;
-      FirebaseWorker::allowConnections(false);
-      hasCloudState = false;
-      mcx.suspend();
-      webSocket.disconnect();
-      Serial.println("[WiFi] Lost hotspot; reconnecting in background.");
-    }
-  }
-  if (!connected && uint32_t(now - lastWifiRetryAt) >= 30000) {
-    lastWifiRetryAt = now;
-    WiFi.reconnect();
-  }
-}
-
-// This loop is the sole WebSocket owner. HTTPS stays in the Firebase task.
-static void serviceFirebaseReplies() {
-  if (!firebaseAvailable || !wsConnected) return;
-  if (!hasPendingFirebaseReply) {
-    hasPendingFirebaseReply = FirebaseWorker::receive(pendingFirebaseReply);
-  }
-  if (!hasPendingFirebaseReply) return;
-  JsonDocument result;
-  if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Ready) {
-    result["type"] = "high_score_ready";
-  } else {
-    result["highScore"] = pendingFirebaseReply.highScore;
-    if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Best) {
-      result["type"] = "high_score";
-      result["requestId"] = pendingFirebaseReply.id;
-    } else {
-      result["type"] = "high_score_result";
-      result["runId"] = pendingFirebaseReply.id;
-      result["score"] = pendingFirebaseReply.score;
-      result["newRecord"] = pendingFirebaseReply.newRecord;
-    }
-  }
-  String json;
-  serializeJson(result, json);
-  if (webSocket.sendTXT(json)) hasPendingFirebaseReply = false;
-}
-
 static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
 
     case WStype_CONNECTED:
       wsConnected = true;
-      FirebaseWorker::allowConnections(true);  // Relay handshake done; HTTPS may start.
       Serial.println("[WS] Connected to relay");
       webSocket.sendTXT("{\"type\":\"identify\",\"role\":\"esp32\"}");
-      // Worker announces readiness once; repeating it after an intentional
-      // TLS pause would trigger another lookup and another disconnect.
       break;
 
     case WStype_DISCONNECTED:
       wsConnected = false;
-      FirebaseWorker::allowConnections(false);  // Its reconnect handshake needs the heap.
-      hasCloudState = false;
-      mcx.suspend();
       Serial.println("[WS] Disconnected");
       break;
 
     case WStype_TEXT: {
-      // Length-aware parsing: WebSocket payloads need not be null terminated.
-      if (length > 512) break;
-      JsonDocument doc;
-      if (deserializeJson(doc, payload, length)) break;
-      const char *kind = doc["type"] | "";
-      // High-score traffic never refreshes the MCX game-state watchdog.
-      if (!strcmp(kind, "get_high_score")) {
-        if (firebaseAvailable) FirebaseWorker::requestBest(doc["requestId"] | "");
-      } else if (!strcmp(kind, "submit_score")) {
-        if (!firebaseAvailable || !doc["score"].is<int>() ||
-            !FirebaseWorker::submit(doc["runId"] | "", doc["score"].as<int>())) {
-          Serial.println("[FIREBASE] Score rejected/unavailable; browser will retry.");
-        }
-      } else if (!strcmp(kind, "game_state")) {
-        if (!doc["lives"].is<unsigned>() || !doc["score"].is<unsigned long>() ||
-            !doc["mode"].is<const char *>()) break;
-        if (mcx.setState(doc["lives"].as<unsigned>(), doc["score"].as<unsigned long>(),
-                         doc["mode"].as<const char *>())) {
-          cloudStateAt = millis();
-          hasCloudState = true;
-          FirebaseWorker::setPlaying(!strcmp(doc["mode"].as<const char *>(), "PLAY"));
-        }
-      } else if (!strcmp(kind, "event") && hasCloudState &&
-                 uint32_t(millis() - cloudStateAt) <= CLOUD_STALE_MS) {
-        const char *event = doc["event"] | "";
-        // Each new game starts "straight ahead" wherever the player now faces.
-        if (!strcmp(event, "START")) tilt.recenterYaw();
-        if (!mcx.queueEvent(event)) Serial.printf("[MCX] Rejected/dropped event: %s\n", event);
+      // Parse game events: {"type":"event","event":"HIT","value":1}
+      // Simple string-based parser (no ArduinoJson dependency)
+      char *s = (char *)payload;
+
+      // Find "event":"<name>"
+      char *evPtr = strstr(s, "\"event\":\"");
+      if (!evPtr) break;
+      evPtr += 9;  // skip past "event":"
+      char *evEnd = strchr(evPtr, '"');
+      if (!evEnd) break;
+      *evEnd = '\0';
+      const char *eventName = evPtr;
+
+      // Find "value":
+      char *valPtr = strstr(evEnd + 1, "\"value\":");
+      int value = 0;
+      if (valPtr) {
+        valPtr += 8;
+        value = atoi(valPtr);
       }
+
+      Serial.printf("[WS] Event: %s = %d\n", eventName, value);
+      forwardToMCX(eventName, value);
       break;
     }
 
@@ -321,46 +356,39 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 /* ════════════════════════════════════════════
  *  BUILD & SEND SENSOR JSON
  * ════════════════════════════════════════════ */
-static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint32_t presses,
-                           int throttle, bool fireHeld) {
-  if (!wsConnected) return false;
-  char json[448];
-  const int len = snprintf(json, sizeof(json),
-    "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,\"yawHold\":%.3f,"
-    "\"tiltValid\":%s,\"joyX\":%.3f,\"joyY\":%.3f,\"fire\":%s,"
-    "\"fireSession\":%lu,\"fireCount\":%lu,\"firePending\":%lu,"
-    "\"fireHeld\":%s,\"throttle\":%d}",
-    reading.pitch, reading.roll, reading.yaw, reading.yawHold, reading.valid ? "true" : "false", jx, jy,
-    presses != lastSentFireCount ? "true" : "false",
-    static_cast<unsigned long>(fireSession), static_cast<unsigned long>(presses),
-    static_cast<unsigned long>(uint32_t(presses - lastSentFireCount)),
-    fireHeld ? "true" : "false", throttle);
-  return len > 0 && len < static_cast<int>(sizeof(json)) && webSocket.sendTXT(json, len);
-}
+static void sendSensorData(SensorData &mpu, float jx, float jy, bool fire) {
+  if (!wsConnected) return;
 
-// Recovery is explicit to avoid repeatedly blocking the loop on broken I2C.
-// Serial: c = recalibrate, r = recenter (pitch/roll/yaw), i = reinitialize a reconnected MPU.
-// begin() fails when no MPU answers at 0x68 or its WHO_AM_I is unknown.
-static void startTilt() {
-  if (!tilt.begin(Wire, 0x68))
-    Serial.println("[TILT] begin failed: no MPU at 0x68 (check VCC/GND/SDA GPIO8/SCL GPIO9), send i to retry");
-}
+  // Build JSON with sprintf (avoids ArduinoJson dependency)
+  char json[256];
+  int len;
 
-static void serviceTilt() {
-  tilt.update();
-  if (Serial.available()) {
-    switch (Serial.read()) {
-      case 'c': tilt.startCalibration(); break;
-      case 'r': tilt.recenter(); break;
-      case 'i': startTilt(); break;
-    }
+  if (potValue >= 0) {
+    len = snprintf(json, sizeof(json),
+      "{\"type\":\"sensor\","
+      "\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
+      "\"joyX\":%.3f,\"joyY\":%.3f,"
+      "\"fire\":%s,"
+      "\"pot\":%.3f}",
+      mpu.pitch, mpu.roll, mpu.yaw,
+      jx, jy,
+      fire ? "true" : "false",
+      potValue
+    );
+  } else {
+    len = snprintf(json, sizeof(json),
+      "{\"type\":\"sensor\","
+      "\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,"
+      "\"joyX\":%.3f,\"joyY\":%.3f,"
+      "\"fire\":%s}",
+      mpu.pitch, mpu.roll, mpu.yaw,
+      jx, jy,
+      fire ? "true" : "false"
+    );
   }
-  const TiltStatus status = tilt.status();
-  if (status != lastTiltStatus) {
-    const char *names[] = {"not started", "calibrating: hold still, component side up",
-                           "ready", "fault: check wiring, then send i", "stale"};
-    Serial.printf("[TILT] %s\n", names[static_cast<unsigned>(status)]);
-    lastTiltStatus = status;
+
+  if (len > 0 && len < (int)sizeof(json)) {
+    webSocket.sendTXT(json);
   }
 }
 
@@ -385,46 +413,36 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_PIN), buttonISR, FALLING);
   Serial.printf("[BTN] GPIO%d, interrupt on FALLING\n", BTN_PIN);
 
-  Serial.println("[ENC] throttle comes from the MCXC444 encoder ($ENC over UART)");
+  // MPU-6050
+  initMPU();
+  lastMPUMicros = micros();
 
-#if USE_JOYSTICK
   // Joystick calibration (read center position at rest)
   calibrateJoystick();
-#endif
 
   // WiFi
-  Serial.printf("[WiFi] Connecting to %s in background\n", WIFI_SSID);
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  lastWifiRetryAt = millis();
-  configTime(0, 0, "time.google.com", "pool.ntp.org");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - wifiStart > 15000) {
+      Serial.println("\n[WiFi] TIMEOUT — continuing without WiFi");
+      break;
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WiFi] Connected!  IP: %s\n", WiFi.localIP().toString().c_str());
+  }
 
-  // WebSocket: plain ws:// to a local relay, or wss:// to a cloud (HTTPS) relay
-#if WS_USE_SSL
+  // WebSocket (SSL for Glitch/HTTPS)
   webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-#else
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
-#endif
   webSocket.onEvent(onWebSocketEvent);
   webSocket.setReconnectInterval(5000);
-  Serial.printf("[WS] Target: %s://%s:%u%s\n", WS_USE_SSL ? "wss" : "ws", WS_HOST,
-                (unsigned)WS_PORT, WS_PATH);
+  Serial.printf("[WS] Target: wss://%s%s\n", WS_HOST, WS_PATH);
 
-  // Begin after blocking startup work; loop() collects calibration samples.
-  fireSession = esp_random();
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);
-  Wire.setTimeOut(20);
-  startTilt();
-  Serial.println("[TILT] Keep still near level for about 2.25 seconds");
-  Serial.println("[TILT] Serial commands: c=calibrate, r=recenter (pitch/roll/yaw), i=reinitialize");
-  FirebaseWorker::allowConnections(false);  // Wait for the relay's TLS handshake.
-  firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{
-      FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD, DATABASE_URL, DEVICE_UID});
-  if (!firebaseAvailable) {
-    Serial.println("[FIREBASE] Disabled: could not allocate worker queues/task; controls remain active.");
-  }
   Serial.println("\n[READY] Entering main loop\n");
 }
 
@@ -432,35 +450,25 @@ void setup() {
  *  MAIN LOOP
  * ════════════════════════════════════════════ */
 void loop() {
-  serviceTilt();  // Poll frequently; TiltController schedules samples at 100 Hz.
-  serviceWiFi(millis());
-  FirebaseWorker::serviceRelay(webSocket);
-  readUART();
-  const uint32_t now = millis();
-  serviceMCX(now);
-  fireHold.update(now, digitalRead(BTN_PIN) == LOW);
+  // Service WebSocket (must call frequently)
+  webSocket.loop();
 
-  if (uint32_t(now - lastSendTime) >= SEND_INTERVAL_MS) {
+  // Read UART from MCX (pot sensor data)
+  readUART();
+
+  // Read all sensors
+  SensorData mpu = readMPU();
+  float jx, jy;
+  readJoystick(jx, jy);
+  bool fire = readButton();
+
+  // Send sensor data to game at fixed interval
+  unsigned long now = millis();
+  if (now - lastSendTime >= SEND_INTERVAL_MS) {
     lastSendTime = now;
-    float jx = 0, jy = 0;
-#if USE_JOYSTICK
-    readJoystick(jx, jy);
-#endif
-    const uint32_t presses = buttonCount();
-    const int throttle = throttleLevel(now);
-    if (throttle != lastPrintedThrottle) {
-      if (throttle < 0) Serial.println("[ENC] no fresh $ENC from MCX (keyboard throttle)");
-      else              Serial.printf("[ENC] throttle %d%%\n", throttle);
-      lastPrintedThrottle = throttle;
-    }
-    if (fireHold.held() != lastPrintedHeld || presses != lastPrintedPresses) {
-      Serial.printf("[BTN] held=%d taps=%lu\n", fireHold.held(), static_cast<unsigned long>(presses));
-      lastPrintedHeld = fireHold.held();
-      lastPrintedPresses = presses;
-    }
-    if (sendSensorData(tilt.latest(), jx, jy, presses, throttle, fireHold.held()))
-      lastSentFireCount = presses;
+    sendSensorData(mpu, jx, jy, fire);
   }
-  serviceFirebaseReplies();
+
+  // Small yield to avoid WDT
   delay(1);
 }

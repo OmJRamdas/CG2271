@@ -100,14 +100,10 @@ renderer.domElement.setAttribute('tabindex', '0');
 renderer.domElement.style.outline = 'none';
 renderer.domElement.addEventListener('click', () => renderer.domElement.focus());
 
+
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
-  if (e.code === 'KeyI' && !e.repeat) {
-    showInputs = !showInputs;
-    document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
-  }
-  if (e.code === 'KeyY' && !e.repeat) toggleYawMode();
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -135,224 +131,42 @@ function readKeyboard() {
   if (keys['Space']) S.fire = true;
 }
 
-/* ===== Controller input ===== */
-const CONTROLLER_STALE_MS = 300;
-const controller = {
-  at: -Infinity, pitch: 0, roll: 0, yaw: 0, yawHold: 0, joyX: 0, joyY: 0,
-  pendingFire: 0, fireSession: null, fireCount: 0,
-  ldrValid: false, dark: false, ldrRaw: 0,
-  fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
-};
-// Press I during a game to show what the hardware controller is sending.
-let showInputs = false;
-let lastSentState = null;
-// Press Y to compare yaw styles. 'rate': yaw while the controller is turning
-// (original). 'hold': keep yawing while it stays twisted away from the front.
-let yawMode = 'rate';
-try { if (localStorage.getItem('yawMode') === 'hold') yawMode = 'hold'; } catch (e) {}
-
-function toggleYawMode() {
-  yawMode = yawMode === 'hold' ? 'rate' : 'hold';
-  try { localStorage.setItem('yawMode', yawMode); } catch (e) {}
-  addKillMsg('YAW MODE: ' + yawMode.toUpperCase());
-}
-
-function clearController() {
-  controller.at = -Infinity;
-  controller.pendingFire = 0;
-  controller.fireHeld = false;
-  controller.throttle = null;
-  controller.throttleApplied = null;
-  controller.tiltValid = false;
-  controller.ldrValid = false;
-  controller.dark = false;
-  S.stealth = false;
-  // Keep the last session/count so reconnects do not replay delivered presses.
-}
-
-function receiveSensor(d) {
-  const axes = ['pitch', 'roll', 'yaw', 'joyX', 'joyY'];
-  if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
-  controller.at = performance.now();
-  for (const key of axes) controller[key] = clamp(d[key], -1, 1);
-  // Optional: firmware without hold-mode yaw leaves it at 0.
-  controller.yawHold = Number.isFinite(d.yawHold) ? clamp(d.yawHold, -1, 1) : 0;
-  controller.tiltValid = d.tiltValid !== false;
-  if (!controller.tiltValid) {
-    controller.pitch = controller.roll = controller.yaw = controller.yawHold = 0;
-  }
-  controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
-    d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
-  controller.dark = controller.ldrValid && d.dark;
-  controller.ldrRaw = controller.ldrValid ? d.ldrRaw : 0;
-  controller.fireHeld = d.fireHeld === true;
-  controller.throttle = Number.isFinite(d.throttle) && d.throttle >= 0 && d.throttle <= 100
-    ? d.throttle : null;
-
-  const uint32 = n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
-  let presses = 0;
-  if (uint32(d.fireSession) && uint32(d.fireCount)) {
-    if (controller.fireSession !== d.fireSession) {
-      controller.fireSession = d.fireSession;
-      controller.pendingFire = 0;
-      // A first packet only owns presses still pending at the ESP32, not its
-      // entire boot history. Subsequent counters recover missed sensor packets.
-      presses = uint32(d.firePending) ? d.firePending : (d.fire === true ? 1 : 0);
-      controller.fireCount = d.fireCount;
-    } else {
-      const delta = (d.fireCount - controller.fireCount) >>> 0;
-      if (delta < 0x80000000) {
-        presses = delta;
-        controller.fireCount = d.fireCount;
-      }
-    }
-  } else if (d.fire === true) presses = 1;  // Legacy boolean sender.
-  if (S.running) controller.pendingFire += presses;
-}
-
-function readInputs() {
-  readKeyboard();  // Original keyboard directions and held-space firing.
-  if (!ws || ws.readyState !== 1 || performance.now() - controller.at > CONTROLLER_STALE_MS) {
-    clearController();
-    return;
-  }
-  S.pIn = controller.pitch;
-  S.rIn = controller.roll;
-  S.yIn = yawMode === 'hold' ? controller.yawHold : controller.yaw;
-  // Joystick X steers yaw too, overriding tilt yaw while pushed (the ESP32
-  // applies the joystick deadzone, so a centred stick sends exactly 0).
-  if (controller.joyX !== 0) S.yIn = controller.joyX;
-  S.stealth = controller.ldrValid && controller.dark;
-  // The encoder reports an absolute level (0..100). Apply it only when it changes,
-  // so Shift/Ctrl keep working between knob movements.
-  if (controller.throttle !== null && controller.throttle !== controller.throttleApplied) {
-    S.targetSpeed = C.MIN_SPD + (controller.throttle / 100) * (C.MAX_SPD - C.MIN_SPD);
-    controller.throttleApplied = controller.throttle;
-  }
-  S.fire = S.fire || controller.fireHeld || controller.pendingFire > 0;
-}
-
-function sendGameState() {
-  if (ws && ws.readyState === 1) {
-    const state = {
-      type: 'game_state',
-      // Preserve the game's 100-point hull; expose three gauge segments to MCX.
-      lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
-      score: Math.floor(clamp(S.score, 0, 9999999)),
-      mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
-    };
-    lastSentState = state;
-    ws.send(JSON.stringify(state));
-  }
-}
-
-function sendEvent(event, value) {
-  if (!['HIT', 'START', 'OVER', 'BONUS'].includes(event)) return;
-  if (ws && ws.readyState === 1) {
-    sendGameState();
-    ws.send(JSON.stringify({ type: 'event', event, value }));
-  }
-}
-
-// Runs on the start screen and after game over too, independently of rendering.
-setInterval(sendGameState, 400);
-
-/* ===== High-score display ===== */
-let bestScore = null;
-let bestRequestId = null;
-const pendingScores = new Map();
-
-function displayBestScore() {
-  const text = bestScore === null ? '—' : String(bestScore);
-  for (const id of ['start-best-score', 'hud-best-score', 'final-best-score']) {
-    document.getElementById(id).textContent = text;
-  }
-}
-
-function requestBestScore() {
-  bestRequestId = createRunId();
-  document.getElementById('best-score-status').textContent = 'Loading best score…';
-  sendScoreRequests();
-}
-
-function sendScoreRequests() {
-  if (!ws || ws.readyState !== 1) return;
-  if (bestRequestId) {
-    ws.send(JSON.stringify({ type: 'get_high_score', requestId: bestRequestId }));
-  }
-  for (const submission of pendingScores.values()) ws.send(JSON.stringify(submission));
-}
-
-function receiveHighScore(d) {
-  if (d.type === 'high_score_ready') { requestBestScore(); return; }
-  if (d.type !== 'high_score' && d.type !== 'high_score_result') return;
-  if (!Number.isInteger(d.highScore) || d.highScore < 0 || d.highScore > 2147483647) return;
-  if (d.type === 'high_score') {
-    if (d.requestId !== bestRequestId) return;
-    bestRequestId = null;
-    document.getElementById('best-score-status').textContent = '';
-  } else {
-    const pending = pendingScores.get(d.runId);
-    if (!pending || pending.score !== d.score || typeof d.newRecord !== 'boolean' ||
-        d.highScore < d.score || (d.newRecord && d.highScore !== d.score)) return;
-    pendingScores.delete(d.runId);
-    if (d.runId === runId && S.over) {
-      document.getElementById('score-save-status').textContent =
-        d.newRecord ? 'New record!' : 'Score checked — best score unchanged.';
-    }
-  }
-  // A delayed response for an older game must not lower the displayed record.
-  bestScore = Math.max(bestScore === null ? 0 : bestScore, d.highScore);
-  displayBestScore();
-}
-
-function queueFinalScore() {
-  pendingScores.set(runId, { type: 'submit_score', runId, score: S.score });
-  document.getElementById('score-save-status').textContent =
-    ws && ws.readyState === 1 ? 'Checking high score…' : 'Connect to check and save your score.';
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(pendingScores.get(runId)));
-}
-
-// Handles either startup order and retries when a response is lost.
-setInterval(sendScoreRequests, 10000);
-
 /* ===== WebSocket ===== */
 function toggleWS() {
   if (ws && ws.readyState <= 1) { ws.close(); return; }
   const url = document.getElementById('ws-url').value.trim();
   if (!url) return;
   try {
-    const socket = new WebSocket(url);
-    ws = socket;
-    clearController();
-    socket.onopen = () => {
-      if (ws !== socket) return;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
       document.getElementById('ws-dot').classList.add('on');
       document.getElementById('ws-btn').textContent = 'Disconnect';
-      socket.send(JSON.stringify({ type: 'identify', role: 'game' }));
-      sendGameState();   // MCX actuators stay silent until the ESP32 has a game state.
-      requestBestScore();
+      ws.send(JSON.stringify({ type: 'identify', role: 'game' }));
     };
-    socket.onclose = () => {
-      if (ws !== socket) return;
-      clearController();
+    ws.onclose = () => {
       document.getElementById('ws-dot').classList.remove('on');
       document.getElementById('ws-btn').textContent = 'Connect';
-      document.getElementById('best-score-status').textContent = 'Offline — connect to load best score.';
-      if (pendingScores.has(runId) && S.over) {
-        document.getElementById('score-save-status').textContent = 'Connection lost — score pending; reconnect to retry.';
-      }
     };
-    socket.onerror = () => socket.close();
-    socket.onmessage = (ev) => {
-      if (ws !== socket) return;
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
-        receiveHighScore(d);
-        if (d && d.type === 'sensor') receiveSensor(d);
+        if (d.type === 'sensor') {
+          if (d.pitch !== undefined) S.pIn = clamp(d.pitch, -1, 1);
+          if (d.roll  !== undefined) S.rIn = clamp(d.roll, -1, 1);
+          if (d.joyX  !== undefined) S.yIn = clamp(d.joyX, -1, 1);
+          if (d.fire) S.fire = true;
+          if (d.pot   !== undefined) S.potThrottle = clamp(d.pot, 0, 1);
+        }
       } catch (_) {}
     };
   } catch (_) {}
+}
+
+function sendEvent(event, value) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'event', event, value }));
+  }
 }
 
 /* ===== Player physics ===== */
@@ -361,8 +175,12 @@ function updatePlayer() {
   S.cR = lerp(S.cR, S.rIn, C.CTRL_LERP);
   S.cY = lerp(S.cY, S.yIn, C.CTRL_LERP);
 
-  // Throttle: Shift/Ctrl adjust; the MCX encoder level is applied in readInputs().
-  S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
+  // Throttle: pot overrides keyboard
+  if (S.potThrottle >= 0) {
+    S.targetSpeed = C.MIN_SPD + S.potThrottle * (C.MAX_SPD - C.MIN_SPD);
+  } else {
+    S.targetSpeed = clamp(S.targetSpeed + S.tIn * 0.015, C.MIN_SPD, C.MAX_SPD);
+  }
   S.speed = lerp(S.speed, S.targetSpeed, 0.03);
 
   _qP.setFromAxisAngle(_axisX, S.cP * C.PITCH_SPD);
@@ -458,8 +276,6 @@ function updatePlayer() {
     projectiles.push(new Projectile(pR, _fwd.clone()));
 
     S.fireCD = C.FIRE_CD;
-    // One controller button press = one volley.
-    if (controller.pendingFire > 0) controller.pendingFire--;
   }
 }
 
@@ -522,7 +338,21 @@ function takeDamage(amount) {
   document.getElementById('damage-flash').style.opacity = '1';
   setTimeout(() => { document.getElementById('damage-flash').style.opacity = '0'; }, 150);
   sendEvent('HIT', 1);
-  if (S.health <= 0) gameOver();
+  if (S.health <= 0) {
+    S.lives--;
+    if (S.lives <= 0) {
+      gameOver();
+    } else {
+      // Respawn — reset health and reposition player
+      S.health = 100;
+      S.speed = 0.6;
+      S.targetSpeed = 0.6;
+      player.mesh.position.set(0, C.START_ALT, 0);
+      player.mesh.quaternion.set(0, 0, 0, 1);
+      S.cP = 0; S.cR = 0; S.cY = 0;
+      addKillMsg('LIFE LOST — ' + S.lives + ' REMAINING');
+    }
+  }
 }
 
 /* ===== Wave system ===== */
@@ -543,7 +373,8 @@ function spawnWave(waveNum) {
   banner.style.opacity = '1';
   setTimeout(() => { banner.style.opacity = '0'; }, 2000);
 
-  if (waveNum > 1) sendEvent('BONUS', waveNum);
+  sendEvent('BOOST', 1);
+  setTimeout(() => sendEvent('BOOST', 0), 500);
 }
 
 function checkWaveComplete() {
@@ -575,33 +406,6 @@ function addKillMsg(text) {
   setTimeout(() => el.remove(), 2200);
 }
 
-function inputDebugText() {
-  const f = v => (v >= 0 ? '+' : '') + v.toFixed(2);
-  const age = performance.now() - controller.at;
-  let link;
-  if (!ws || ws.readyState !== 1) link = 'disconnected (click Connect)';
-  else if (!Number.isFinite(age) || age > CONTROLLER_STALE_MS) link = 'connected, no sensor data from ESP32';
-  else link = 'connected (' + age.toFixed(0) + ' ms ago)';
-  const live = ws && ws.readyState === 1 && age <= CONTROLLER_STALE_MS;
-  const lines = ['LINK  ' + link];
-  if (live) {
-    lines.push('TILT  ' + (controller.tiltValid
-      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) +
-        ' yaw ' + f(controller.yaw) + ' (rate)  hold ' + f(controller.yawHold)
-      : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
-    lines.push('YAW   mode ' + yawMode.toUpperCase() + ' (press Y)');
-    lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
-    lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
-    lines.push('THR   ' + (controller.throttle !== null
-      ? controller.throttle + ' %'
-      : 'none: no $ENC from MCX (keyboard Shift/Ctrl)'));
-  }
-  lines.push('MCX   sent: ' + (lastSentState
-    ? lastSentState.mode + '  lives ' + lastSentState.lives + '  score ' + lastSentState.score
-    : 'nothing yet'));
-  return lines.join('\n');
-}
-
 function updateHUD() {
   document.getElementById('score').textContent = S.score;
   document.getElementById('kills').textContent = S.kills + ' KILL' + (S.kills !== 1 ? 'S' : '');
@@ -615,11 +419,19 @@ function updateHUD() {
     : S.health > 25
       ? 'linear-gradient(90deg,#fbbf24,#f59e0b)'
       : 'linear-gradient(90deg,#ef4444,#dc2626)';
+  // Lives display
+  let livesStr = '';
+  for (let i = 0; i < S.lives; i++) livesStr += '✈ ';
+  document.getElementById('lives-display').textContent = livesStr.trim();
+
   document.getElementById('speed-box').textContent = 'SPD: ' + (S.speed * 100).toFixed(0);
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
   document.getElementById('pos-box').textContent = 'POS: ' + Math.round(player.mesh.position.x) + ', ' + Math.round(player.mesh.position.z);
 
-  if (showInputs) document.getElementById('input-debug').textContent = inputDebugText();
+  if (ws && ws.readyState === 1) {
+    const euler = new THREE.Euler().setFromQuaternion(player.mesh.quaternion, 'YXZ');
+    sendEvent('ROLL', Math.round(THREE.MathUtils.radToDeg(euler.z)));
+  }
 }
 
 /* ===== Minimap ===== */
@@ -710,38 +522,22 @@ function updateMinimap() {
 }
 
 /* ===== Game over / restart ===== */
-function createRunId() {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
-    return globalThis.crypto.randomUUID();
-  }
-  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) +
-    '-' + Math.random().toString(36).slice(2);
-}
-
-let runId = createRunId();
-
 function gameOver() {
-  // Several collisions can end the same frame. Submit only once per game.
-  if (S.over) return;
   S.over = true;
   S.running = false;
   document.getElementById('final-score').textContent = S.score;
   document.getElementById('final-wave').textContent = S.wave;
   document.getElementById('game-over').style.display = 'flex';
-  sendEvent('OVER', S.score);   // MCX game-over feedback
-  // Separate from the MCX event: only this message is a completed, scored run.
-  queueFinalScore();
+  sendEvent('SCORE', S.score);
 }
 
 function restartGame() {
-  runId = createRunId();
-  document.getElementById('score-save-status').textContent = '';
-  S.score = 0; S.kills = 0; S.health = 100;
+  S.score = 0; S.kills = 0; S.lives = 3; S.health = 100;
   S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;
   S.fireCD = 0; S.dmgCD = 0; S.over = false; S.running = true;
-  S.fire = false;
+  S.fire = false; S.potThrottle = -1;
   S.wave = 1; S.waveEnemiesAlive = 0; S.waveTransition = false; S.waveDelay = 0;
 
   projectiles.forEach(p => p.remove());      projectiles.length = 0;
@@ -751,7 +547,6 @@ function restartGame() {
 
   initPlayer();
   spawnWave(1);
-  sendEvent('START', 1);
   document.getElementById('game-over').style.display = 'none';
   document.getElementById('hud').style.display = 'block';
   loop();
@@ -762,7 +557,7 @@ function loop() {
   if (!S.running) return;
   requestAnimationFrame(loop);
 
-  readInputs();
+  readKeyboard();
   updatePlayer();
   S.dmgCD = Math.max(0, S.dmgCD - 1);
 
@@ -794,6 +589,5 @@ document.getElementById('start-screen').addEventListener('click', () => {
   renderer.domElement.focus();
   S.running = true;
   spawnWave(1);
-  sendEvent('START', 1);
   loop();
 });
