@@ -19,6 +19,7 @@ function game() {
     normalize() { return this; }
   }
   class Quaternion {
+    set() { return this; }
     setFromAxisAngle() { return this; }
     multiply() { return this; }
     normalize() { return this; }
@@ -201,12 +202,20 @@ test('malformed axes do not refresh timeout and stale LDR cannot hold stealth', 
   assert.equal(g.run('S.stealth'), false);
 });
 
-test('state heartbeat maps hull to three gauge segments and runs after game over', () => {
+test('state heartbeat sends game lives, which respawns count down to game over', () => {
   const g = game();
-  for (const [health, lives] of [[100, 3], [67, 3], [66, 2], [34, 2], [33, 1], [1, 1], [0, 0]]) {
-    g.run(`S.health = ${health}; sendGameState()`);
-    assert.equal(g.packets.at(-1).lives, lives);
-  }
+  g.run('sendGameState()');
+  assert.equal(g.packets.at(-1).lives, 3);
+  g.run('S.health = 50; sendGameState()');  // Hull damage alone keeps the life.
+  assert.equal(g.packets.at(-1).lives, 3);
+  g.run('takeDamage(50)');                   // Hull empty: lose a life and respawn.
+  assert.equal(g.run('S.lives'), 2);
+  assert.equal(g.run('S.health'), 100);
+  assert.equal(g.packets.at(-1).lives, 2);
+  assert.equal(g.run('S.over'), false);
+  g.run('takeDamage(100); takeDamage(100)');
+  assert.equal(g.run('S.over'), true);
+  g.run('S.over = false; S.running = true');  // Restore, then check the OVER heartbeat.
   g.run('S.running = false; S.over = true; S.score = 123');
   g.timers[0]();
   assert.deepEqual(g.packets.at(-1), { type: 'game_state', lives: 0, score: 123, mode: 'OVER' });
