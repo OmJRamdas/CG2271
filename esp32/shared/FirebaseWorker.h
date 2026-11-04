@@ -48,6 +48,9 @@ static unsigned scoreHead = 0, scoreCount = 0;
 static unsigned completedCount = 0, completedNext = 0;
 static char pendingReadId[65] = "";
 static int cachedHighScore = 0;
+// The S2 cannot hold two TLS handshakes at once ("SSL - Memory allocation failed").
+// A sketch with its own TLS WebSocket blocks HTTPS until that socket is connected.
+static volatile bool connectionsAllowed = true;
 
 static bool validId(const char *id) {
   const size_t length = strlen(id);
@@ -80,6 +83,8 @@ static bool requestBest(const char *id) {
 static bool receive(Reply &reply) {
   return outbox && xQueueReceive(outbox, &reply, 0) == pdTRUE;
 }
+
+static void allowConnections(bool allowed) { connectionsAllowed = allowed; }
 
 static bool sendScoreResult(const PendingScore &job) {
   Reply reply = {};
@@ -115,6 +120,10 @@ static int request(const String &url, const char *method,
   if (!strcmp(method, "GET")) code = http.GET();
   else if (!strcmp(method, "PUT")) code = http.PUT(body);
   else code = http.POST(body);
+  if (code < 0) {
+    Serial.printf("[TLS] Connection failed; free heap %u, largest block %u bytes\n",
+                  unsigned(ESP.getFreeHeap()), unsigned(ESP.getMaxAllocHeap()));
+  }
   response = code > 0 ? http.getString() : "";
   if (etag) *etag = http.header("ETag");
   http.end();
@@ -303,7 +312,7 @@ static void taskMain(void *) {
       attempted = false;
       idToken = "";
     }
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && connectionsAllowed) {
       if (time(nullptr) < 1767225600) {
         if (!waitingForTimeLogged) {
           Serial.println("[TIME] Waiting for network time; WebSocket handling continues.");
