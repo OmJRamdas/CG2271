@@ -66,7 +66,7 @@ function game() {
     run: code => vm.runInContext(code, context),
     packet: data => {
       context.packet = { type: 'sensor', pitch: 0.4, roll: -0.6, yaw: 0.2,
-        joyX: -0.3, joyY: 0.7, tiltValid: true,
+        joyX: 0, joyY: 0.7, tiltValid: true,  // centred stick: tilt yaw
         fireSession: 1, fireCount: 0, firePending: 0, fire: false,
         ldrValid: false, ...data };
       vm.runInContext('receiveSensor(packet)', context);
@@ -87,9 +87,19 @@ test('controller axes persist across frames and preserve every sign', () => {
     assert.equal(g.run('S.pIn'), 0.4);
     assert.equal(g.run('S.rIn'), -0.6);
     assert.equal(g.run('S.yIn'), 0.2);
-    assert.equal(g.run('S.camX'), -0.3);
-    assert.equal(g.run('S.camY'), 0.7);
   }
+});
+
+test('pushed joystick X steers yaw over tilt yaw in either yaw mode', () => {
+  const g = game();
+  g.packet({ joyX: -0.3, yaw: 0.2, yawHold: 0.8 });
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), -0.3);
+  g.run('toggleYawMode(); readInputs()');
+  assert.equal(g.run('S.yIn'), -0.3);
+  g.packet({ joyX: 0, yaw: 0.2, yawHold: 0.8 });  // Released: tilt yaw again.
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), 0.8);
 });
 
 test('Y switches yaw between turning rate and held twist', () => {
@@ -128,12 +138,14 @@ test('stale/disconnected controller falls back to original keyboard controls', (
   assert.equal(g.run('S.pIn'), -1);
 });
 
-test('calibration/fault neutralizes tilt while camera and fire remain usable', () => {
+test('calibration/fault neutralizes tilt while joystick yaw and fire remain usable', () => {
   const g = game();
   g.packet({ tiltValid: false, fire: true, fireCount: 1, firePending: 1 });
   g.run('readInputs()');
   assert.equal(g.run('S.pIn + S.rIn + S.yIn'), 0);
-  assert.equal(g.run('S.camY'), 0.7);
+  g.packet({ tiltValid: false, joyX: 0.5 });
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), 0.5);
   assert.equal(g.run('S.fire'), true);
 });
 

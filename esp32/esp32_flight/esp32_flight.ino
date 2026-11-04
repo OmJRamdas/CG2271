@@ -124,7 +124,7 @@ uint32_t cloudStateAt = 0;
 unsigned long lastSendTime = 0;
 TiltStatus lastTiltStatus = TiltStatus::NotStarted;
 
-// Joystick camera controls retain their original axes, signs and deadzone.
+// Joystick X steers yaw in the game; axes, signs and deadzone are unchanged.
 static void calibrateJoystick() {
   long sumX = 0, sumY = 0;
   for (int i = 0; i < 30; i++) {
