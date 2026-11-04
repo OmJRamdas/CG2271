@@ -199,7 +199,7 @@ class TiltController {
   static constexpr float CALIBRATION_MAX_ROTATION_DPS = 5.0f;
   static constexpr float CALIBRATION_MAX_TILT_DEG = 45.0f;
   static constexpr float CALIBRATION_MOVEMENT_G = 0.03f;
-  static constexpr float TILT_DEADZONE_DEG = 1.5f;
+  static constexpr float TILT_DEADZONE_DEG = 10.0f;  // Ignore small, unintended tilts.
   static constexpr float YAW_DEADZONE_DPS = 3.0f;
   static constexpr float YAW_HOLD_DEADZONE_DEG = 5.0f;  // Wider: also hides slow drift.
 
