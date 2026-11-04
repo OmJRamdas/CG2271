@@ -199,7 +199,7 @@ class TiltController {
   static constexpr float CALIBRATION_MAX_ROTATION_DPS = 5.0f;
   static constexpr float CALIBRATION_MAX_TILT_DEG = 45.0f;
   static constexpr float CALIBRATION_MOVEMENT_G = 0.03f;
-  static constexpr float TILT_DEADZONE_DEG = 1.5f;
+  static constexpr float TILT_DEADZONE_DEG = 10.0f;
   static constexpr float YAW_DEADZONE_DPS = 3.0f;
   static constexpr float YAW_HOLD_DEADZONE_DEG = 5.0f;  // Wider: also hides slow drift.
 
@@ -424,10 +424,13 @@ class TiltController {
     return angle;
   }
   static float gameControl(float value, float fullScale, float deadzone) {
-    // A small neutral deadzone reduces unintended motion. Outside it, preserve
-    // the repo's direct angle / 45 mapping, clamped to the game's input range.
+    // A neutral deadzone reduces unintended motion. Outside the deadzone the
+    // output ramps smoothly from 0 at the edge to +/-1 at fullScale, avoiding
+    // a discontinuous jump when the player first tilts past the threshold.
     if (fabsf(value) <= deadzone) return 0.0f;
-    return clamp(value / fullScale, -1.0f, 1.0f);
+    float sign = value > 0.0f ? 1.0f : -1.0f;
+    float adjusted = fabsf(value) - deadzone;
+    return clamp(sign * adjusted / (fullScale - deadzone), -1.0f, 1.0f);
   }
   void publishReading(float correctedYawRate) {
     reading_.pitchDeg = wrapDegrees(filteredPitchDeg_ - neutralPitchDeg_);

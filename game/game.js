@@ -522,7 +522,21 @@ function takeDamage(amount) {
   document.getElementById('damage-flash').style.opacity = '1';
   setTimeout(() => { document.getElementById('damage-flash').style.opacity = '0'; }, 150);
   sendEvent('HIT', 1);
-  if (S.health <= 0) gameOver();
+  if (S.health <= 0) {
+    S.lives--;
+    if (S.lives <= 0) {
+      gameOver();
+    } else {
+      // Respawn — reset health and reposition player
+      S.health = 100;
+      S.speed = 0.6;
+      S.targetSpeed = 0.6;
+      player.mesh.position.set(0, C.START_ALT, 0);
+      player.mesh.quaternion.set(0, 0, 0, 1);
+      S.cP = 0; S.cR = 0; S.cY = 0;
+      addKillMsg('LIFE LOST — ' + S.lives + ' REMAINING');
+    }
+  }
 }
 
 /* ===== Wave system ===== */
@@ -615,6 +629,11 @@ function updateHUD() {
     : S.health > 25
       ? 'linear-gradient(90deg,#fbbf24,#f59e0b)'
       : 'linear-gradient(90deg,#ef4444,#dc2626)';
+  // Lives display
+  let livesStr = '';
+  for (let i = 0; i < S.lives; i++) livesStr += '✈ ';
+  document.getElementById('lives-display').textContent = livesStr.trim();
+
   document.getElementById('speed-box').textContent = 'SPD: ' + (S.speed * 100).toFixed(0);
   document.getElementById('alt-box').textContent = 'ALT: ' + (player.mesh.position.y - C.GROUND_Y).toFixed(0);
   document.getElementById('pos-box').textContent = 'POS: ' + Math.round(player.mesh.position.x) + ', ' + Math.round(player.mesh.position.z);
@@ -736,7 +755,7 @@ function gameOver() {
 function restartGame() {
   runId = createRunId();
   document.getElementById('score-save-status').textContent = '';
-  S.score = 0; S.kills = 0; S.health = 100;
+  S.score = 0; S.kills = 0; S.lives = 3; S.health = 100;
   S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;

@@ -43,7 +43,7 @@ const C = {
 
 /* ===== Mutable game state ===== */
 const S = {
-  score: 0, kills: 0, health: 100, speed: 0.6, targetSpeed: 0.6,
+  score: 0, kills: 0, lives: 3, health: 100, speed: 0.6, targetSpeed: 0.6,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
   fireCD: 0, dmgCD: 0,
