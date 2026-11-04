@@ -27,7 +27,6 @@ canvas{display:block}
 #speed-box{position:absolute;bottom:20px;left:20px;color:rgba(255,255,255,.7);font-size:14px}
 #alt-box{position:absolute;bottom:40px;left:20px;color:rgba(255,255,255,.7);font-size:14px}
 #pos-box{position:absolute;bottom:60px;left:20px;color:rgba(255,255,255,.7);font-size:14px}
-#input-debug{position:absolute;top:60px;left:20px;display:none;white-space:pre;font-family:monospace;font-size:12px;line-height:1.45;color:rgba(255,255,255,.85);background:rgba(0,0,0,.45);padding:6px 10px;border-radius:4px}
 
 #minimap{position:absolute;bottom:20px;right:20px;width:150px;height:150px;border-radius:50%;border:2px solid rgba(255,255,255,.3);background:rgba(0,0,0,.4);backdrop-filter:blur(4px)}
 
@@ -50,7 +49,7 @@ canvas{display:block}
 #damage-flash{position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse,transparent 40%,rgba(255,0,0,.3));pointer-events:none;z-index:8;opacity:0;transition:opacity .1s}
 #stealth-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,10,40,.45);pointer-events:none;z-index:7;opacity:0;transition:opacity .6s}
 
-#connect-panel{position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:40;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.5);padding:6px 12px;border-radius:8px;backdrop-filter:blur(8px)}
+#connect-panel{position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:20;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.5);padding:6px 12px;border-radius:8px;backdrop-filter:blur(8px)}
 #ws-url{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;padding:5px 10px;border-radius:4px;font-size:12px;width:260px;outline:none}
 #ws-url:focus{border-color:rgba(255,255,255,.4)}
 #ws-btn{background:#3b82f6;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600}
@@ -90,30 +89,28 @@ canvas{display:block}
 <div id="start-screen">
   <h1>SKY STRIKE</h1>
   <div class="sub">DOGFIGHT ARENA</div>
-  <div style="color:#fbbf24;margin-top:16px">Best score: <span id="start-best-score">—</span></div>
-  <div id="best-score-status" style="color:#ccc;font-size:13px;margin-top:6px">Connect to load best score.</div>
   <div class="hint">Click anywhere to start</div>
 </div>
 
 <div id="hud" style="display:none">
-  <div id="score-box"><div id="score">0</div><div id="kills">0 KILLS</div><div style="color:#fbbf24;font-size:14px">BEST: <span id="hud-best-score">—</span></div></div>
+  <div id="score-box"><div id="score">0</div><div id="kills">0 KILLS</div></div>
   <div id="wave-box"><div id="wave-label">WAVE 1</div><div id="enemies-left">1 enemy remaining</div></div>
   <div id="health-box">
     <div id="health-label">HULL INTEGRITY</div>
     <div id="health-bar"><div id="health-fill"></div></div>
+    <div id="lives-display" style="color:rgba(255,255,255,.7);font-size:14px;margin-top:6px;letter-spacing:2px">&#9992; &#9992; &#9992;</div>
   </div>
-  <div id="input-debug"></div>
   <div id="pos-box">POS: 0, 0</div>
   <div id="alt-box">ALT: 0</div>
   <div id="speed-box">SPD: 0</div>
   <div id="crosshair"><div id="dot"></div></div>
   <canvas id="minimap" width="150" height="150"></canvas>
   <div id="killfeed"></div>
-  <div id="controls-help">WASD Pitch/Roll &nbsp; Q/E Yaw &nbsp; Shift/Ctrl Throttle &nbsp; Space Fire &nbsp; Y Yaw mode</div>
+  <div id="controls-help">WASD Pitch/Roll &nbsp; Q/E Yaw &nbsp; Shift/Ctrl Throttle &nbsp; Space Fire</div>
 </div>
 
 <div id="connect-panel">
-  <input id="ws-url" type="text" value="wss://skystrike-relay.onrender.com" spellcheck="false">
+  <input id="ws-url" type="text" placeholder="wss://your-relay.glitch.me" spellcheck="false">
   <button id="ws-btn" onclick="toggleWS()" tabindex="-1">Connect</button>
   <div id="ws-dot"></div>
 </div>
@@ -121,8 +118,6 @@ canvas{display:block}
 <div id="game-over">
   <h1>SHOT DOWN</h1>
   <div class="sub">Final Score: <span id="final-score">0</span></div>
-  <div class="sub">Best Score: <span id="final-best-score">—</span></div>
-  <div id="score-save-status" style="color:#fbbf24;margin:8px 0" aria-live="polite"></div>
   <div class="sub2">Survived to Wave <span id="final-wave">1</span></div>
   <button id="restart-btn" onclick="restartGame()">FLY AGAIN</button>
 </div>
