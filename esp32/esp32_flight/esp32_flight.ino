@@ -307,6 +307,54 @@ static void forwardToMCX(const char *event, int value) {
 /* ════════════════════════════════════════════
  *  WEBSOCKET
  * ════════════════════════════════════════════ */
+static void serviceWiFi(uint32_t now) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected != wifiWasConnected) {
+    wifiWasConnected = connected;
+    if (connected) {
+      Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+      configTime(0, 0, "time.google.com", "pool.ntp.org");
+    } else {
+      wsConnected = false;
+      hasCloudState = false;
+      mcx.suspend();
+      webSocket.disconnect();
+      Serial.println("[WiFi] Lost hotspot; reconnecting in background.");
+    }
+  }
+  if (!connected && uint32_t(now - lastWifiRetryAt) >= 30000) {
+    lastWifiRetryAt = now;
+    WiFi.reconnect();
+  }
+}
+
+// This loop is the sole WebSocket owner. HTTPS stays in the Firebase task.
+static void serviceFirebaseReplies() {
+  if (!firebaseAvailable || !wsConnected) return;
+  if (!hasPendingFirebaseReply) {
+    hasPendingFirebaseReply = FirebaseWorker::receive(pendingFirebaseReply);
+  }
+  if (!hasPendingFirebaseReply) return;
+  JsonDocument result;
+  if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Ready) {
+    result["type"] = "high_score_ready";
+  } else {
+    result["highScore"] = pendingFirebaseReply.highScore;
+    if (pendingFirebaseReply.type == FirebaseWorker::ReplyType::Best) {
+      result["type"] = "high_score";
+      result["requestId"] = pendingFirebaseReply.id;
+    } else {
+      result["type"] = "high_score_result";
+      result["runId"] = pendingFirebaseReply.id;
+      result["score"] = pendingFirebaseReply.score;
+      result["newRecord"] = pendingFirebaseReply.newRecord;
+    }
+  }
+  String json;
+  serializeJson(result, json);
+  if (webSocket.sendTXT(json)) hasPendingFirebaseReply = false;
+}
+
 static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
   switch (type) {
 
@@ -318,6 +366,8 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
     case WStype_DISCONNECTED:
       wsConnected = false;
+      hasCloudState = false;
+      mcx.suspend();
       Serial.println("[WS] Disconnected");
       break;
 
@@ -443,6 +493,19 @@ void setup() {
   webSocket.setReconnectInterval(5000);
   Serial.printf("[WS] Target: wss://%s%s\n", WS_HOST, WS_PATH);
 
+  // Begin after blocking startup work; loop() collects calibration samples.
+  fireSession = esp_random();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+  Wire.setTimeOut(20);
+  startTilt();
+  Serial.println("[TILT] Keep still near level for about 2.25 seconds");
+  Serial.println("[TILT] Serial commands: c=calibrate, r=recenter (pitch/roll/yaw), i=reinitialize");
+  firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{
+      FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD, DATABASE_URL, DEVICE_UID});
+  if (!firebaseAvailable) {
+    Serial.println("[FIREBASE] Disabled: could not allocate worker queues/task; controls remain active.");
+  }
   Serial.println("\n[READY] Entering main loop\n");
 }
 
