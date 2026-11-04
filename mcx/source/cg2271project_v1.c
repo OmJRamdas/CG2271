@@ -64,9 +64,10 @@
 #define PORTA_INT_PRIO       2U
 
 #define RED_PIN              31U    /* PTE31 onboard active-LOW red LED  */
-#define HAS_SERVO             0     /* set to 1 once the SG90 is wired to PTA5 */
+#define HAS_SERVO             1     /* set to 1 once the SG90 is wired to PTA5 */
 #define SERVO_PIN             5U    /* PTA5  TPM0_CH2                    */
 #define SERVO_CH              2U
+#define SERVO_REVERSE         1     /* 1: lives gauge turns anticlockwise   */
 #define BUZZER_PIN            4U    /* PTD4  GPIO, active buzzer         */
 #define BUZZER_ACTIVE_LOW     0     /* set to 1 if LOW makes it beep     */
 #define ENC_CLK_PIN          12U    /* PTA12 GPIO, encoder CLK (D3)      */
@@ -215,6 +216,9 @@ static void initServo(void)
 static void setServoDeg(uint32_t deg)
 {
     if (deg > 180U) deg = 180U;
+#if SERVO_REVERSE
+    deg = 180U - deg;                            /* mirror the sweep direction */
+#endif
     TPM0->CONTROLS[SERVO_CH].CnV = SERVO_MIN_CNV + deg * (SERVO_MAX_CNV - SERVO_MIN_CNV) / 180U;
 }
 #endif /* HAS_SERVO */
