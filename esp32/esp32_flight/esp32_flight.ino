@@ -124,7 +124,7 @@ uint32_t cloudStateAt = 0;
 unsigned long lastSendTime = 0;
 TiltStatus lastTiltStatus = TiltStatus::NotStarted;
 
-// Joystick camera controls retain their original axes, signs and deadzone.
+// Joystick X steers yaw in the game; axes, signs and deadzone are unchanged.
 static void calibrateJoystick() {
   long sumX = 0, sumY = 0;
   for (int i = 0; i < 30; i++) {
@@ -220,6 +220,7 @@ static void serviceWiFi(uint32_t now) {
       configTime(0, 0, "time.google.com", "pool.ntp.org");
     } else {
       wsConnected = false;
+      FirebaseWorker::allowConnections(false);
       hasCloudState = false;
       mcx.suspend();
       webSocket.disconnect();
@@ -264,6 +265,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
     case WStype_CONNECTED:
       wsConnected = true;
+      FirebaseWorker::allowConnections(true);  // Relay handshake done; HTTPS may start.
       Serial.println("[WS] Connected to relay");
       webSocket.sendTXT("{\"type\":\"identify\",\"role\":\"esp32\"}");
       if (firebaseAvailable) webSocket.sendTXT("{\"type\":\"high_score_ready\"}");
@@ -271,6 +273,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
     case WStype_DISCONNECTED:
       wsConnected = false;
+      FirebaseWorker::allowConnections(false);  // Its reconnect handshake needs the heap.
       hasCloudState = false;
       mcx.suspend();
       Serial.println("[WS] Disconnected");
@@ -414,6 +417,7 @@ void setup() {
   startTilt();
   Serial.println("[TILT] Keep still near level for about 2.25 seconds");
   Serial.println("[TILT] Serial commands: c=calibrate, r=recenter (pitch/roll/yaw), i=reinitialize");
+  FirebaseWorker::allowConnections(false);  // Wait for the relay's TLS handshake.
   firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{
       FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD, DATABASE_URL, DEVICE_UID});
   if (!firebaseAvailable) {

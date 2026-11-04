@@ -18,10 +18,6 @@ const C = {
   CAM_DIST: 14,
   CAM_H: 5,
   CAM_LERP: 0.055,
-  CAM_ORBIT_SPD: 1.2,
-  CAM_ORBIT_LERP: 0.06,
-  MOUSE_SENS: 0.003,      // pointer-lock mouse sensitivity
-  MOUSE_V_CLAMP: 1.2,     // max vertical orbit (radians)
   CTRL_LERP: 0.07,
   PITCH_SPD: 0.05,
   ROLL_SPD: 0.1,
@@ -49,8 +45,6 @@ const C = {
 const S = {
   score: 0, kills: 0, health: 100, speed: 0.6, targetSpeed: 0.6,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
-  camX: 0, camY: 0,        // raw joystick / mouse camera input
-  sCamX: 0, sCamY: 0,      // smoothed camera orbit
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
   fireCD: 0, dmgCD: 0,
   running: false, over: false,
