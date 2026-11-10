@@ -202,20 +202,12 @@ test('malformed axes do not refresh timeout and stale LDR cannot hold stealth', 
   assert.equal(g.run('S.stealth'), false);
 });
 
-test('state heartbeat sends game lives, which respawns count down to game over', () => {
+test('state heartbeat maps hull to ten gauge steps and runs after game over', () => {
   const g = game();
-  g.run('sendGameState()');
-  assert.equal(g.packets.at(-1).lives, 3);
-  g.run('S.health = 50; sendGameState()');  // Hull damage alone keeps the life.
-  assert.equal(g.packets.at(-1).lives, 3);
-  g.run('takeDamage(50)');                   // Hull empty: lose a life and respawn.
-  assert.equal(g.run('S.lives'), 2);
-  assert.equal(g.run('S.health'), 100);
-  assert.equal(g.packets.at(-1).lives, 2);
-  assert.equal(g.run('S.over'), false);
-  g.run('takeDamage(100); takeDamage(100)');
-  assert.equal(g.run('S.over'), true);
-  g.run('S.over = false; S.running = true');  // Restore, then check the OVER heartbeat.
+  for (const [health, lives] of [[100, 10], [91, 10], [90, 9], [55, 6], [11, 2], [10, 1], [1, 1], [0, 0]]) {
+    g.run(`S.health = ${health}; sendGameState()`);
+    assert.equal(g.packets.at(-1).lives, lives);
+  }
   g.run('S.running = false; S.over = true; S.score = 123');
   g.timers[0]();
   assert.deepEqual(g.packets.at(-1), { type: 'game_state', lives: 0, score: 123, mode: 'OVER' });

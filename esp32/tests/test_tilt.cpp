@@ -24,6 +24,10 @@ static void level() {
 static void near(float actual, float expected, float tolerance = 0.015f) {
   assert(fabsf(actual - expected) < tolerance);
 }
+// Game control outside the deadzone ramps from 0 at its edge to 1 at full scale.
+static float ramp(float value, float deadzone, float fullScale) {
+  return (value - deadzone) / (fullScale - deadzone);
+}
 
 int main() {
   TiltConfig config;
@@ -50,24 +54,24 @@ int main() {
     mockAcceleration.acceleration.x = sign * 9.80665f * 0.5f;
     mockAcceleration.acceleration.z = 9.80665f * sqrtf(0.75f);
     tick(tilt, 200);
-    near(tilt.latest().pitch, sign * 30.0f / 45);
+    near(tilt.latest().pitch, sign * ramp(30, 10, 45));
     near(tilt.latest().roll, 0);
     level();
     tick(tilt, 200);
     mockAcceleration.acceleration.y = sign * 9.80665f * 0.5f;
     mockAcceleration.acceleration.z = 9.80665f * sqrtf(0.75f);
     tick(tilt, 200);
-    near(tilt.latest().roll, sign * 30.0f / 45);
+    near(tilt.latest().roll, sign * ramp(30, 10, 45));
     near(tilt.latest().pitch, 0);
   }
   level();
   tick(tilt, 200);
   mockGyro.gyro.z = 0.785398163f;  // +45 deg/s, original positive yaw.
   tick(tilt);
-  near(tilt.latest().yaw, 0.5f);
+  near(tilt.latest().yaw, ramp(45, 3, 90));
   mockGyro.gyro.z = -0.785398163f;
   tick(tilt);
-  near(tilt.latest().yaw, -0.5f);
+  near(tilt.latest().yaw, -ramp(45, 3, 90));
   mockGyro.gyro.z = 0;
   tick(tilt);
   near(tilt.latest().yaw, 0);
@@ -80,10 +84,10 @@ int main() {
     mockGyro.gyro.z = sign * 0.785398163f;  // 45 deg/s for 0.5 s = 22.5 deg.
     tick(tilt, 50);
     near(tilt.latest().yawDeg, sign * 22.5f, 0.5f);
-    near(tilt.latest().yawHold, sign * 0.5f, 0.02f);
+    near(tilt.latest().yawHold, sign * ramp(22.5f, 5, 45), 0.02f);
     mockGyro.gyro.z = 0;
     tick(tilt, 50);  // Holding still keeps yawing, while the rate output stops.
-    near(tilt.latest().yawHold, sign * 0.5f, 0.02f);
+    near(tilt.latest().yawHold, sign * ramp(22.5f, 5, 45), 0.02f);
     near(tilt.latest().yaw, 0);
     mockGyro.gyro.z = -sign * 0.785398163f;  // Turn back to the front.
     tick(tilt, 50);

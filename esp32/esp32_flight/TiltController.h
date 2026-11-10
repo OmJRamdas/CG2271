@@ -424,10 +424,13 @@ class TiltController {
     return angle;
   }
   static float gameControl(float value, float fullScale, float deadzone) {
-    // A small neutral deadzone reduces unintended motion. Outside it, preserve
-    // the repo's direct angle / 45 mapping, clamped to the game's input range.
+    // A neutral deadzone reduces unintended motion. Outside the deadzone the
+    // output ramps smoothly from 0 at the edge to +/-1 at fullScale, avoiding
+    // a discontinuous jump when the player first tilts past the threshold.
     if (fabsf(value) <= deadzone) return 0.0f;
-    return clamp(value / fullScale, -1.0f, 1.0f);
+    float sign = value > 0.0f ? 1.0f : -1.0f;
+    float adjusted = fabsf(value) - deadzone;
+    return clamp(sign * adjusted / (fullScale - deadzone), -1.0f, 1.0f);
   }
   void publishReading(float correctedYawRate) {
     reading_.pitchDeg = wrapDegrees(filteredPitchDeg_ - neutralPitchDeg_);
