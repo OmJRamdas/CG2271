@@ -22,7 +22,7 @@ function getWaveParams(waveNum) {
     return {
       scale: 1.5,           // 1.5× bigger model
       speed: 0.5,           // half speed
-      hp: 2,
+      hp: 1,
       fireCD: 120,          // slow fire rate
       turnRate: 0.012,      // sluggish turning
       projSpeed: 2.5,       // slow bullets
@@ -30,11 +30,10 @@ function getWaveParams(waveNum) {
     };
   }
   if (waveNum <= 4) {
-    const hpBonus = Math.min(waveNum - 1, 3);
     return {
       scale: 1.0,
       speed: 1.0,
-      hp: 2 + hpBonus,
+      hp: 1,
       fireCD: 70,
       turnRate: 0.025,
       projSpeed: 3.5,
@@ -42,11 +41,10 @@ function getWaveParams(waveNum) {
     };
   }
   // Wave 5+
-  const hpBonus = Math.min(waveNum - 1, 5);
   return {
     scale: 0.7,                                    // 0.7× smaller
     speed: Math.min(1.3 + (waveNum - 5) * 0.1, 2.0),
-    hp: 3 + hpBonus,
+    hp: 1,
     fireCD: 45,
     turnRate: 0.035,
     projSpeed: 4.5,

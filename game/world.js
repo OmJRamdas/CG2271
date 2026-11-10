@@ -105,34 +105,29 @@ function buildWorld() {
   terrain.position.y = C.GROUND_Y;
   scene.add(terrain);
 
-  // Fog wall cylinder surrounding the map border
-  const fogHeight = C.CEILING - C.GROUND_Y;
-  const fogGeo = new THREE.CylinderGeometry(C.WORLD * 0.95, C.WORLD * 0.95, fogHeight, 64, 1, true);
-  const fogMat = new THREE.MeshBasicMaterial({
-    color: 0xc8dde8,
-    transparent: true,
-    opacity: 0.45,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    fog: false,
+  // Fog wall — multiple layered cylinders for a thick misty border
+  const fogHeight = C.CEILING - C.GROUND_Y + 100;
+  const fogLayers = [
+    { r: C.WORLD * 0.85, color: 0xffffff, opacity: 0.25 },
+    { r: C.WORLD * 0.90, color: 0xddeeff, opacity: 0.35 },
+    { r: C.WORLD * 0.95, color: 0xccddee, opacity: 0.50 },
+    { r: C.WORLD * 1.00, color: 0xbbccdd, opacity: 0.65 },
+    { r: C.WORLD * 1.08, color: 0xaabbcc, opacity: 0.80 },
+  ];
+  fogLayers.forEach(l => {
+    const geo = new THREE.CylinderGeometry(l.r, l.r, fogHeight, 64, 1, true);
+    const mat = new THREE.MeshBasicMaterial({
+      color: l.color,
+      transparent: true,
+      opacity: l.opacity,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      fog: false,
+    });
+    const wall = new THREE.Mesh(geo, mat);
+    wall.position.y = C.GROUND_Y + fogHeight / 2 - 50;
+    scene.add(wall);
   });
-  const fogWall = new THREE.Mesh(fogGeo, fogMat);
-  fogWall.position.y = C.GROUND_Y + fogHeight / 2;
-  scene.add(fogWall);
-
-  // Second, slightly larger fog layer for depth
-  const fogGeo2 = new THREE.CylinderGeometry(C.WORLD * 1.05, C.WORLD * 1.05, fogHeight, 64, 1, true);
-  const fogMat2 = new THREE.MeshBasicMaterial({
-    color: 0xb0c8d8,
-    transparent: true,
-    opacity: 0.3,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    fog: false,
-  });
-  const fogWall2 = new THREE.Mesh(fogGeo2, fogMat2);
-  fogWall2.position.y = C.GROUND_Y + fogHeight / 2;
-  scene.add(fogWall2);
 
   // Clouds
   const cmat = new THREE.MeshPhongMaterial({ color: 0xffffff, transparent: true, opacity: 0.75, flatShading: true });

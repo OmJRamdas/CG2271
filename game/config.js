@@ -19,9 +19,9 @@ const C = {
   CAM_H: 5,
   CAM_LERP: 0.055,
   CTRL_LERP: 0.07,
-  PITCH_SPD: 0.05,
-  ROLL_SPD: 0.1,
-  YAW_SPD: 0.05,
+  PITCH_SPD: 0.028,
+  ROLL_SPD: 0.07,
+  YAW_SPD: 0.018,
   BANK_YAW: 0.012,
   DMG_COOLDOWN: 40,
 
@@ -43,7 +43,7 @@ const C = {
 
 /* ===== Mutable game state ===== */
 const S = {
-  score: 0, kills: 0, health: 100, speed: 0.6, targetSpeed: 0.6,
+  score: 0, kills: 0, lives: 3, health: 100, speed: 0.6, targetSpeed: 0.6,
   pIn: 0, rIn: 0, yIn: 0, tIn: 0, fire: false,
   cP: 0, cR: 0, cY: 0,    // smoothed control inputs
   fireCD: 0, dmgCD: 0,

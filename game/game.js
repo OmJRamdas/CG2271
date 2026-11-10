@@ -739,7 +739,7 @@ function gameOver() {
 function restartGame() {
   runId = createRunId();
   document.getElementById('score-save-status').textContent = '';
-  S.score = 0; S.kills = 0; S.health = 100;
+  S.score = 0; S.kills = 0; S.lives = 3; S.health = 100;
   S.speed = 0.6; S.targetSpeed = 0.6;
   S.pIn = 0; S.rIn = 0; S.yIn = 0; S.tIn = 0;
   S.cP = 0; S.cR = 0; S.cY = 0;

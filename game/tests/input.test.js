@@ -19,6 +19,7 @@ function game() {
     normalize() { return this; }
   }
   class Quaternion {
+    set() { return this; }
     setFromAxisAngle() { return this; }
     multiply() { return this; }
     normalize() { return this; }
