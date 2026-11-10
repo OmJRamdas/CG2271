@@ -236,8 +236,8 @@ function sendGameState() {
   if (ws && ws.readyState === 1) {
     const state = {
       type: 'game_state',
-      // Preserve the game's 100-point hull; expose three gauge segments to MCX.
-      lives: Math.ceil(clamp(S.health, 0, 100) * 3 / 100),
+      // Hull in 10% steps (0..10) for the MCX servo gauge: one step per 10% lost.
+      lives: Math.ceil(clamp(S.health, 0, 100) / 10),
       score: Math.floor(clamp(S.score, 0, 9999999)),
       mode: S.over ? 'OVER' : S.running ? 'PLAY' : 'IDLE',
     };

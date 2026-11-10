@@ -201,9 +201,9 @@ test('malformed axes do not refresh timeout and stale LDR cannot hold stealth', 
   assert.equal(g.run('S.stealth'), false);
 });
 
-test('state heartbeat maps hull to three gauge segments and runs after game over', () => {
+test('state heartbeat maps hull to ten gauge steps and runs after game over', () => {
   const g = game();
-  for (const [health, lives] of [[100, 3], [67, 3], [66, 2], [34, 2], [33, 1], [1, 1], [0, 0]]) {
+  for (const [health, lives] of [[100, 10], [91, 10], [90, 9], [55, 6], [11, 2], [10, 1], [1, 1], [0, 0]]) {
     g.run(`S.health = ${health}; sendGameState()`);
     assert.equal(g.packets.at(-1).lives, lives);
   }

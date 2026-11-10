@@ -27,7 +27,7 @@
  *     encoderTask  pri 2   report throttle level to ESP32 on change + 500 ms
  *     ledTask      pri 1   LED patterns           } time-sliced with
  *     buzzerTask   pri 1   beep patterns          } each other
- *     servoTask    pri 1   lives gauge            }
+ *     servoTask    pri 1   hull gauge             }
  *   Sync:
  *     Queues   rxQueue, txQueue, ledQueue, buzzerQueue
  *     Mutex    gameStateMutex (GameState), printMutex (debug console)
@@ -67,7 +67,7 @@
 #define HAS_SERVO             1     /* set to 1 once the SG90 is wired to PTA5 */
 #define SERVO_PIN             5U    /* PTA5  TPM0_CH2                    */
 #define SERVO_CH              2U
-#define SERVO_REVERSE         1     /* 1: lives gauge turns anticlockwise   */
+#define SERVO_REVERSE         1     /* 1: hull gauge turns anticlockwise    */
 #define BUZZER_PIN            4U    /* PTD4  GPIO, active buzzer         */
 #define BUZZER_ACTIVE_LOW     0     /* set to 1 if LOW makes it beep     */
 #define ENC_CLK_PIN          12U    /* PTA12 GPIO, encoder CLK (D3)      */
@@ -97,7 +97,7 @@
 #define LED_FLASH_MS        100U
 #define SERVO_PERIOD_MS      50U
 #define SERVO_SLEW_DEG        6U    /* max change per period -> smooth sweep */
-#define GAUGE_MAX_LIVES       3     /* lives that map to 180 deg            */
+#define GAUGE_STEPS          10     /* $GS level 10 (full hull) = 180 deg   */
 
 /* ===================================================================
  * Types
@@ -594,7 +594,8 @@ static void buzzerTask(void *p)
 #if HAS_SERVO
 /* ===================================================================
  * TASK: servoTask (priority 1)
- * Lives gauge: 0 lives = 0 deg, GAUGE_MAX_LIVES = 180 deg, slewed for a
+ * Hull gauge: the $GS level field carries the hull in 10% steps (0..10),
+ * so the servo moves 18 deg for every 10% of hull lost. Slewed for a
  * smooth sweep. Reads GameState under the mutex every SERVO_PERIOD_MS.
  * =================================================================*/
 static void servoTask(void *p)
@@ -612,9 +613,9 @@ static void servoTask(void *p)
             xSemaphoreGive(gameStateMutex);
         }
 
-        if (lives > GAUGE_MAX_LIVES) lives = GAUGE_MAX_LIVES;
+        if (lives > GAUGE_STEPS) lives = GAUGE_STEPS;
         uint32_t target = (mode == MODE_OVER) ? 0U
-                        : (uint32_t)lives * 180U / (uint32_t)GAUGE_MAX_LIVES;
+                        : (uint32_t)lives * 180U / (uint32_t)GAUGE_STEPS;
 
         if (current + SERVO_SLEW_DEG < target)       current += SERVO_SLEW_DEG;
         else if (current > target + SERVO_SLEW_DEG)  current -= SERVO_SLEW_DEG;
