@@ -32,18 +32,15 @@ using TiltSensor = Adafruit_MPU6050;
 struct TiltConfig {
   float pitchSign = 1.0f;       // Change to -1 if the game's direction is reversed.
   float rollSign = 1.0f;
-  float yawSign = 1.0f;
 };
 
+// Pitch and roll only: yaw comes from the joystick, because twisting about the
+// vertical axis leaves gravity unchanged and the gyro alone measures only speed.
 struct TiltReading {
   float pitchDeg = 0;          // Tilt relative to the calibrated neutral pose.
   float rollDeg = 0;
-  float yawRateDps = 0;        // Rotation SPEED about sensor Z, not heading.
   float pitch = 0;             // Game controls: -1 .. +1.
   float roll = 0;
-  float yaw = 0;
-  float yawDeg = 0;            // Twist (heading) relative to neutral; drifts slowly.
-  float yawHold = 0;           // Game control from yawDeg: -1 .. +1 while held.
   uint32_t sampleTimeMs = 0;
   bool valid = false;
 };
@@ -58,8 +55,6 @@ class TiltController {
   static constexpr uint32_t STALE_AFTER_MS = 150;
   static constexpr float MAX_PITCH_DEG = 45.0f;
   static constexpr float MAX_ROLL_DEG = 45.0f;
-  static constexpr float MAX_YAW_RATE_DPS = 90.0f;
-  static constexpr float MAX_YAW_DEG = 45.0f;
 
   explicit TiltController(const TiltConfig &config = TiltConfig())
       : config_(config) {}
@@ -92,7 +87,6 @@ class TiltController {
     state_ = TiltStatus::Calibrating;
     reading_ = TiltReading();
     filterInitialized_ = false;
-    yawAngleDeg_ = 0;
     clearCalibrationSamples();
     calibrationStartMs_ = millis();
     lastPollUs_ = micros();
@@ -103,16 +97,8 @@ class TiltController {
     if (!latest().valid) return false;
     neutralPitchDeg_ = filteredPitchDeg_;
     neutralRollDeg_ = filteredRollDeg_;
-    yawAngleDeg_ = 0;
-    publishReading(reading_.yawRateDps);
+    publishReading();
     return true;
-  }
-
-  // Make the current facing direction "straight ahead" without touching pitch/roll.
-  // The yaw twist has no gravity reference, so this is how its drift is cleared.
-  void recenterYaw() {
-    yawAngleDeg_ = 0;
-    if (latest().valid) publishReading(reading_.yawRateDps);
   }
 
   // Read this function first. The helper functions below explain each step.
@@ -146,8 +132,7 @@ class TiltController {
     if (!updateFilteredAngles(sample, accelerationAngles, sampleTimeUs)) return false;
 
     // 6. Convert neutral-relative angles into the game's -1 to +1 controls.
-    const float correctedYawRateDps = sample.gyroZDps - gyroZOffsetDps_;
-    publishReading(correctedYawRateDps);
+    publishReading();
     return true;
   }
 
@@ -160,8 +145,6 @@ class TiltController {
     if (!out.valid) {
       out.pitch = 0;
       out.roll = 0;
-      out.yaw = 0;
-      out.yawHold = 0;
     }
     return out;
   }
@@ -187,7 +170,6 @@ class TiltController {
   struct Angles {
     float pitchDeg = 0;
     float rollDeg = 0;
-    float yawRateDps = 0;      // Heading rate; only set by predictAnglesFromGyro().
   };
 
   static constexpr float STANDARD_GRAVITY = 9.80665f;
@@ -200,8 +182,6 @@ class TiltController {
   static constexpr float CALIBRATION_MAX_TILT_DEG = 45.0f;
   static constexpr float CALIBRATION_MOVEMENT_G = 0.03f;
   static constexpr float TILT_DEADZONE_DEG = 10.0f;  // Ignore small, unintended tilts.
-  static constexpr float YAW_DEADZONE_DPS = 3.0f;
-  static constexpr float YAW_HOLD_DEADZONE_DEG = 5.0f;  // Wider: also hides slow drift.
 
   // STEP 2: sensor reading and unit conversion.
   bool readMeasurements(Measurements &result) {
@@ -321,11 +301,10 @@ class TiltController {
     filteredPitchDeg_ = startingAngles.pitchDeg;
     neutralRollDeg_ = filteredRollDeg_;
     neutralPitchDeg_ = filteredPitchDeg_;
-    yawAngleDeg_ = 0;
     filterInitialized_ = true;
     lastSampleUs_ = sampleTimeUs;
     state_ = TiltStatus::Ready;
-    publishReading(sample.gyroZDps - gyroZOffsetDps_);
+    publishReading();
     return true;
   }
 
@@ -355,8 +334,6 @@ class TiltController {
     }
 
     const Angles prediction = predictAnglesFromGyro(sample, elapsedSeconds);
-    // Yaw has no gravity correction: it is the gyro heading rate integrated over time.
-    yawAngleDeg_ = wrapDegrees(yawAngleDeg_ + prediction.yawRateDps * elapsedSeconds);
 
     // gyroWeight near 1 trusts the gyro more. Expressing it using elapsed time
     // keeps the tuning consistent when sample intervals vary slightly.
@@ -394,8 +371,6 @@ class TiltController {
 
     // Angle change = rotation speed * elapsed time.
     Angles prediction;
-    prediction.yawRateDps = (sinRoll * correctedY + cosRoll * correctedZ) /
-                            cosf(pitchRadians);
     prediction.rollDeg = wrapDegrees(filteredRollDeg_ + rollRateDps * elapsedSeconds);
     prediction.pitchDeg = wrapDegrees(filteredPitchDeg_ + pitchRateDps * elapsedSeconds);
     return prediction;
@@ -432,19 +407,13 @@ class TiltController {
     float adjusted = fabsf(value) - deadzone;
     return clamp(sign * adjusted / (fullScale - deadzone), -1.0f, 1.0f);
   }
-  void publishReading(float correctedYawRate) {
+  void publishReading() {
     reading_.pitchDeg = wrapDegrees(filteredPitchDeg_ - neutralPitchDeg_);
     reading_.rollDeg = wrapDegrees(filteredRollDeg_ - neutralRollDeg_);
-    reading_.yawRateDps = correctedYawRate;
     const float pitchControl = gameControl(reading_.pitchDeg, MAX_PITCH_DEG, TILT_DEADZONE_DEG);
     const float rollControl = gameControl(reading_.rollDeg, MAX_ROLL_DEG, TILT_DEADZONE_DEG);
-    const float yawControl = gameControl(correctedYawRate, MAX_YAW_RATE_DPS, YAW_DEADZONE_DPS);
     reading_.pitch = config_.pitchSign * pitchControl;
     reading_.roll = config_.rollSign * rollControl;
-    reading_.yaw = config_.yawSign * yawControl;
-    reading_.yawDeg = yawAngleDeg_;
-    reading_.yawHold = config_.yawSign *
-        gameControl(yawAngleDeg_, MAX_YAW_DEG, YAW_HOLD_DEADZONE_DEG);
     reading_.sampleTimeMs = millis();
     reading_.valid = true;
   }
@@ -494,5 +463,4 @@ class TiltController {
   float filteredRollDeg_ = 0;
   float neutralPitchDeg_ = 0;
   float neutralRollDeg_ = 0;
-  float yawAngleDeg_ = 0;
 };
