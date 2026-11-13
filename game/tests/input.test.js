@@ -66,8 +66,8 @@ function game() {
   return {
     run: code => vm.runInContext(code, context),
     packet: data => {
-      context.packet = { type: 'sensor', pitch: 0.4, roll: -0.6, yaw: 0.2,
-        joyX: 0, joyY: 0.7, tiltValid: true,  // centred stick: tilt yaw
+      context.packet = { type: 'sensor', pitch: 0.4, roll: -0.6,
+        joyX: 0, joyY: 0.7, tiltValid: true,  // centred stick: no yaw
         fireSession: 1, fireCount: 0, firePending: 0, fire: false,
         ldrValid: false, ...data };
       vm.runInContext('receiveSensor(packet)', context);
@@ -87,40 +87,34 @@ test('controller axes persist across frames and preserve every sign', () => {
     g.run('readInputs()');
     assert.equal(g.run('S.pIn'), 0.4);
     assert.equal(g.run('S.rIn'), -0.6);
-    assert.equal(g.run('S.yIn'), 0.2);
+    assert.equal(g.run('S.yIn'), 0);
   }
 });
 
-test('pushed joystick X steers yaw over tilt yaw in either yaw mode', () => {
+test('joystick X alone steers yaw; the MPU gives pitch and roll only', () => {
   const g = game();
-  g.packet({ joyX: -0.3, yaw: 0.2, yawHold: 0.8 });
+  g.packet({ joyX: -0.3 });
   g.run('readInputs()');
   assert.equal(g.run('S.yIn'), -0.3);
-  g.run('toggleYawMode(); readInputs()');
-  assert.equal(g.run('S.yIn'), -0.3);
-  g.packet({ joyX: 0, yaw: 0.2, yawHold: 0.8 });  // Released: tilt yaw again.
+  g.packet({ joyX: 0.6 });
   g.run('readInputs()');
-  assert.equal(g.run('S.yIn'), 0.8);
-});
-
-test('Y switches yaw between turning rate and held twist', () => {
-  const g = game();
-  g.packet({ yaw: 0.2, yawHold: 0.8 });
-  g.run('readInputs()');
-  assert.equal(g.run('yawMode'), 'rate');
-  assert.equal(g.run('S.yIn'), 0.2);
-  g.run('toggleYawMode(); readInputs()');
-  assert.equal(g.run('yawMode'), 'hold');
-  assert.equal(g.run('S.yIn'), 0.8);
-  g.packet({ yaw: 0.2, yawHold: 0.8, tiltValid: false });
-  g.run('readInputs()');
-  assert.equal(g.run('S.yIn'), 0);
-  g.packet({});  // Older firmware without yawHold: packet accepted, no hold yaw.
+  assert.equal(g.run('S.yIn'), 0.6);
+  // Old firmware still sending tilt yaw fields: accepted, but they never steer.
+  g.packet({ joyX: 0, yaw: 0.9, yawHold: 0.8 });
   g.run('readInputs()');
   assert.equal(g.run('S.yIn'), 0);
   assert.equal(g.run('S.pIn'), 0.4);
-  g.run('toggleYawMode(); readInputs()');
-  assert.equal(g.run('S.yIn'), 0.2);
+  assert.equal(g.run("typeof toggleYawMode"), 'undefined');
+});
+
+test('Q/E keyboard yaw still works while the joystick is centred', () => {
+  const g = game();
+  g.packet({});
+  g.run('keys.KeyQ = true; readInputs()');
+  assert.equal(g.run('S.yIn'), 1);
+  g.packet({ joyX: -0.4 });  // A pushed stick overrides the key.
+  g.run('readInputs()');
+  assert.equal(g.run('S.yIn'), -0.4);
 });
 
 test('stale/disconnected controller falls back to original keyboard controls', () => {

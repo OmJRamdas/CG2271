@@ -107,7 +107,6 @@ document.addEventListener('keydown', e => {
     showInputs = !showInputs;
     document.getElementById('input-debug').style.display = showInputs ? 'block' : 'none';
   }
-  if (e.code === 'KeyY' && !e.repeat) toggleYawMode();
   if (e.key === ' ' || e.keyCode === 32) keys['Space'] = true;
   e.preventDefault();
 });
@@ -138,7 +137,7 @@ function readKeyboard() {
 /* ===== Controller input ===== */
 const CONTROLLER_STALE_MS = 300;
 const controller = {
-  at: -Infinity, pitch: 0, roll: 0, yaw: 0, yawHold: 0, joyX: 0, joyY: 0,
+  at: -Infinity, pitch: 0, roll: 0, joyX: 0, joyY: 0,
   pendingFire: 0, fireSession: null, fireCount: 0,
   ldrValid: false, dark: false, ldrRaw: 0,
   fireHeld: false, throttle: null, throttleApplied: null, tiltValid: false,
@@ -146,17 +145,6 @@ const controller = {
 // Press I during a game to show what the hardware controller is sending.
 let showInputs = false;
 let lastSentState = null;
-// Press Y to compare yaw styles. 'rate': yaw while the controller is turning
-// (original). 'hold': keep yawing while it stays twisted away from the front.
-let yawMode = 'rate';
-try { if (localStorage.getItem('yawMode') === 'hold') yawMode = 'hold'; } catch (e) {}
-
-function toggleYawMode() {
-  yawMode = yawMode === 'hold' ? 'rate' : 'hold';
-  try { localStorage.setItem('yawMode', yawMode); } catch (e) {}
-  addKillMsg('YAW MODE: ' + yawMode.toUpperCase());
-}
-
 function clearController() {
   controller.at = -Infinity;
   controller.pendingFire = 0;
@@ -171,15 +159,14 @@ function clearController() {
 }
 
 function receiveSensor(d) {
-  const axes = ['pitch', 'roll', 'yaw', 'joyX', 'joyY'];
+  // The MPU-6050 gives pitch and roll only; yaw is the joystick's X axis.
+  const axes = ['pitch', 'roll', 'joyX', 'joyY'];
   if (!axes.every(key => typeof d[key] === 'number' && Number.isFinite(d[key]))) return;
   controller.at = performance.now();
   for (const key of axes) controller[key] = clamp(d[key], -1, 1);
-  // Optional: firmware without hold-mode yaw leaves it at 0.
-  controller.yawHold = Number.isFinite(d.yawHold) ? clamp(d.yawHold, -1, 1) : 0;
   controller.tiltValid = d.tiltValid !== false;
   if (!controller.tiltValid) {
-    controller.pitch = controller.roll = controller.yaw = controller.yawHold = 0;
+    controller.pitch = controller.roll = 0;
   }
   controller.ldrValid = d.ldrValid === true && Number.isInteger(d.ldrRaw) &&
     d.ldrRaw >= 0 && d.ldrRaw <= 4095 && typeof d.dark === 'boolean';
@@ -218,9 +205,8 @@ function readInputs() {
   }
   S.pIn = controller.pitch;
   S.rIn = controller.roll;
-  S.yIn = yawMode === 'hold' ? controller.yawHold : controller.yaw;
-  // Joystick X steers yaw too, overriding tilt yaw while pushed (the ESP32
-  // applies the joystick deadzone, so a centred stick sends exactly 0).
+  // Joystick X is the rudder (the ESP32 applies its deadzone, so a centred
+  // stick sends exactly 0). Q/E still yaw while the stick is centred.
   if (controller.joyX !== 0) S.yIn = controller.joyX;
   S.stealth = controller.ldrValid && controller.dark;
   // The encoder reports an absolute level (0..100). Apply it only when it changes,
@@ -588,11 +574,9 @@ function inputDebugText() {
   const lines = ['LINK  ' + link];
   if (live) {
     lines.push('TILT  ' + (controller.tiltValid
-      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll) +
-        ' yaw ' + f(controller.yaw) + ' (rate)  hold ' + f(controller.yawHold)
+      ? 'valid  pitch ' + f(controller.pitch) + ' roll ' + f(controller.roll)
       : 'INVALID (calibrating or MPU fault: hold still / check ESP32 serial)'));
-    lines.push('YAW   mode ' + yawMode.toUpperCase() + ' (press Y)');
-    lines.push('JOY   x ' + f(controller.joyX) + ' y ' + f(controller.joyY));
+    lines.push('JOY   x ' + f(controller.joyX) + ' (yaw)  y ' + f(controller.joyY));
     lines.push('FIRE  taps ' + controller.fireCount + '  held ' + (controller.fireHeld ? 'YES' : 'no'));
     lines.push('THR   ' + (controller.throttle !== null
       ? controller.throttle + ' %'

@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-A tilt-controlled browser flight game where physical sensors on the ESP32 and MCXC444 drive a Three.js airplane through a cloud-hosted WebSocket relay. The player tilts the MPU-6050 to steer, uses a joystick to orbit the camera, presses a button to fire, and turns a rotary encoder on the MCXC444 to set the throttle. Game events feed back to the MCXC444 to drive LEDs, a buzzer, and a servo.
+A tilt-controlled browser flight game where physical sensors on the ESP32 and MCXC444 drive a Three.js airplane through a cloud-hosted WebSocket relay. The player tilts the MPU-6050 to steer, pushes the joystick sideways to yaw (rudder), presses a button to fire, and turns a rotary encoder on the MCXC444 to set the throttle. Game events feed back to the MCXC444 to drive LEDs, a buzzer, and a servo.
 
 ## Architecture
 
@@ -67,7 +67,7 @@ A tilt-controlled browser flight game where physical sensors on the ESP32 and MC
 | # | Sensor | Connected to | Interface | Polled / Interrupt | Purpose |
 |---|--------|--------------|-----------|--------------------|---------|
 | 1 | GY-521 MPU-6050 | ESP32-S2 | I2C (SDA/SCL) | Polled (100 Hz) | Tilt → pitch & roll of airplane |
-| 2 | Joystick module | ESP32-S2 | 2× ADC | Polled (ADC) | Camera orbit (X/Y); joystick switch is not connected by this sketch |
+| 2 | Joystick module | ESP32-S2 | 2× ADC | Polled (ADC) | X = yaw (rudder); Y is sent but unused; joystick switch is not connected by this sketch |
 | 3 | Push button | ESP32-S2 | GPIO | Interrupt (falling edge) | Fire (one shot per debounced press) |
 | 4 | Rotary encoder | MCXC444 | CLK PTA12 (D3), DT PTA13 (D8) | Interrupt (PORTA pin change) | Throttle 0–100 % |
 
@@ -107,9 +107,9 @@ After WiFi startup, hold the controller still, component side up, near level. Ca
 
 ### Direction compatibility
 
-The sketch sets `pitchSign = -1`, `rollSign = -1`, and `yawSign = +1`, for the GY-521 held components up with its X arrow pointing forward. Nose up gives positive pitch (the game's nose up, key S). Right edge down gives negative roll, which is the game's right bank (key D); with `rollSign = +1` the plane banked the wrong way. Positive Z rotation gives positive yaw. Independent pitch and roll still reach full input at 45 degrees from neutral; yaw reaches full input at 90 degrees/second. Yaw is rotation speed, so twisting and then holding the controller still returns yaw input to zero. The estimator uses the physically matching gyro axes rather than retaining the old filter's crossed X/Y gyro terms. Near neutral, the module applies a 1.5-degree tilt deadzone and a 3-degree/second yaw deadzone.
+The sketch sets `pitchSign = -1` and `rollSign = -1`, for the GY-521 held components up with its X arrow pointing forward. Nose up gives positive pitch (the game's nose up, key S). Right edge down gives negative roll, which is the game's right bank (key D); with `rollSign = +1` the plane banked the wrong way. Independent pitch and roll reach full input at 45 degrees from neutral. The MPU-6050 does not provide yaw: a twist about the vertical axis leaves gravity unchanged, and the gyro alone measures only rotation speed, so yaw comes from the joystick. The estimator uses the physically matching gyro axes rather than retaining the old filter's crossed X/Y gyro terms. Near neutral, the module applies a 10-degree tilt deadzone, and the output ramps from 0 at its edge to full at 45 degrees.
 
-The joystick retains its original X/Y directions, 80-count deadzone, and camera-orbit role. Keyboard directions remain unchanged: W/S pitch, A/D roll, Q/E yaw, arrows/mouse camera, Shift/Ctrl throttle, and held Space to fire repeatedly. With fresh sensor packets the physical controller owns pitch/roll/yaw/camera; keyboard throttle and Space remain available. If no sensor packet arrives for 300 ms or the browser WebSocket closes, the browser clears queued controller input and falls back to keyboard/mouse.
+The joystick keeps its original X/Y directions and 80-count deadzone; its X axis is the rudder (yaw). Keyboard directions remain unchanged: W/S pitch, A/D roll, Q/E yaw, Shift/Ctrl throttle, and held Space to fire repeatedly. With fresh sensor packets the MPU-6050 owns pitch/roll and a pushed joystick owns yaw; Q/E (while the stick is centred), keyboard throttle and Space remain available. If no sensor packet arrives for 300 ms or the browser WebSocket closes, the browser clears queued controller input and falls back to keyboard/mouse.
 
 The fire button retains falling-edge interrupts and 50 ms debounce. Accepted edges increment a counter under a shared ISR/loop critical section. Packets include `fireSession` (per ESP32 boot), `fireCount` (cumulative accepted edges), `firePending` (edges since the last successful send), and the compatible `fire` boolean. The ESP32 advances its sent counter only after WebSocket send succeeds. The browser queues new presses, ignores duplicate counters, recovers skipped packets within a session, and consumes one press only when a projectile is actually fired. A later `fire:false` packet or an active weapon cooldown cannot erase a queued press. Held Space keeps its original repeated-fire behavior. Presses received outside gameplay are not queued; disconnects, controller timeout, restart, and game over clear pending shots.
 
@@ -121,7 +121,7 @@ MCX `$ENC` reports are forwarded as `throttle` (0–100). An encoder report expi
 
 ### Browser/ESP32 messages
 
-- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"yaw":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"fireHeld":false,"throttle":50}` (`throttle` is `-1` when no fresh MCX encoder reading).
+- ESP32 → browser: `{"type":"sensor","pitch":0,"roll":0,"tiltValid":true,"joyX":0,"joyY":0,"fire":false,"fireSession":123,"fireCount":0,"firePending":0,"fireHeld":false,"throttle":50}` (`throttle` is `-1` when no fresh MCX encoder reading).
 - Browser → ESP32: `{"type":"game_state","lives":3,"score":0,"mode":"PLAY"}` every 400 ms, including on the start screen (`IDLE`) and after game over (`OVER`). The 100-point hull is preserved; the servo's three segments use `ceil(health * 3 / 100)` (100–67 → 3, 66–34 → 2, 33–1 → 1, 0 → 0).
 - Browser → ESP32: `{"type":"event","event":"HIT","value":1}` for player damage; `START` at start/restart; `OVER` at game over; `BONUS` on a subsequent wave. Enemy kills update score/state, rather than triggering player-hit feedback. State is sent before each event. Legacy `ROLL`, `SCORE`, and `BOOST` UART commands are no longer used.
 
@@ -225,7 +225,7 @@ From the repo root on Windows with Node.js, Python, and GCC/G++ on PATH:
 
 This runs the existing MCX parser suite, ESP32/MCX interoperability checks against the real C parser (including checksums, ACK/NAK, lost-ACK duplicates, bounded retries, queue limits, and sequence wrap), tilt/button tests using deterministic sensor/clock substitutes, browser input/shot/state tests using the production JavaScript with a rendering substitute, and the UART simulator self-test. Outputs go into ignored `.build/`. Sensor substitutes test algorithm and integration behavior; they do not replace an ESP32 firmware build or real I2C testing.
 
-Before a demo, compile/upload for ESP32-S2 with the listed libraries, then verify: calibration while still and while moving; both directions of each axis; no movement at neutral; yaw returning to zero when rotation stops; quick button presses across packet intervals and cooldowns; MPU unplug/reconnect and explicit `i` recovery; browser/relay interruption and keyboard fallback; encoder turns in both directions and stale `$ENC` telemetry; and MCX START/HIT/BONUS/OVER feedback. Confirm a lost ACK does not replay feedback and prolonged cloud loss triggers the MCX watchdog.
+Before a demo, compile/upload for ESP32-S2 with the listed libraries, then verify: calibration while still and while moving; both directions of each axis; no movement at neutral; twisting the controller does not yaw; joystick X yaws both ways; quick button presses across packet intervals and cooldowns; MPU unplug/reconnect and explicit `i` recovery; browser/relay interruption and keyboard fallback; encoder turns in both directions and stale `$ENC` telemetry; and MCX START/HIT/BONUS/OVER feedback. Confirm a lost ACK does not replay feedback and prolonged cloud loss triggers the MCX watchdog.
 
 
 ```sh
@@ -255,7 +255,7 @@ For bench testing without a deployed relay. The demo itself should use a cloud r
    - Don't commit your Wi-Fi password.
 6. **Game:** open `game/index.html` in a browser (it needs internet, for Three.js). Enter `ws://localhost:3000` and click **Connect**. The relay window should print `Game registered`.
 7. **Check both directions:**
-   - **ESP32 → game:** tilt steers, the joystick orbits the camera, the button fires, and the encoder knob changes speed.
+   - **ESP32 → game:** tilt pitches and rolls, the joystick yaws, the button fires, and the encoder knob changes speed.
    - **Game → MCX:** the red LED is solid during play, triple-flashes and beeps on a hit, and fast-blinks at game over.
 
 If the ESP32 keeps printing `[WS] Disconnected`, check `WS_HOST`, the firewall, and whether the hotspot blocks devices from reaching each other.
@@ -326,8 +326,8 @@ These are two standalone programs that print every sensor reading and actuator s
 ## Work Breakdown (5 Members)
 
 ### Stream 1 — ESP32 Sensor Hub
-- Wire and read MPU-6050 over I2C (pitch, roll, yaw).
-- Wire joystick (2× ADC for camera orbit).
+- Wire and read MPU-6050 over I2C (pitch, roll).
+- Wire joystick (2× ADC; X = yaw).
 - Wire push button with debounce.
 - Package sensor readings into JSON for WebSocket.
 - UART to MCXC444 with checksummed state/events, ACK/NAK retries and encoder throttle reception.
@@ -356,7 +356,7 @@ These are two standalone programs that print every sensor reading and actuator s
 ### Stream 5 — Browser Flight Game
 - Three.js scene: sky, terrain, airplane model.
 - WebSocket client connects to cloud relay.
-- Map persistent sensor data to pitch/roll/yaw, camera orbit, fire, and encoder throttle; keep keyboard throttle as fallback.
+- Map persistent sensor data to pitch/roll (MPU), yaw (joystick X), fire, and encoder throttle; keep keyboard throttle as fallback.
 - Send 400 ms game-state heartbeats and START/HIT/BONUS/OVER events back.
 - Host on GitHub Pages or Netlify.
 

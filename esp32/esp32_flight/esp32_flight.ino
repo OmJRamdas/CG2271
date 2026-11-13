@@ -6,8 +6,8 @@
  * to the MCXC444 via UART for actuator control.
  *
  * Sensors on this board:
- *   MPU-6050 (I2C)  → pitch, roll, yaw   (flight control)
- *   Joystick (ADC)  → camera X / Y       (camera orbit)
+ *   MPU-6050 (I2C)  → pitch, roll        (flight control)
+ *   Joystick (ADC)  → X = yaw (rudder)
  *   Push button     → fire               (GPIO interrupt)
  * Rotary encoder (throttle) is on the MCXC444; it arrives here as $ENC.
  *
@@ -303,8 +303,6 @@ static void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
       } else if (!strcmp(kind, "event") && hasCloudState &&
                  uint32_t(millis() - cloudStateAt) <= CLOUD_STALE_MS) {
         const char *event = doc["event"] | "";
-        // Each new game starts "straight ahead" wherever the player now faces.
-        if (!strcmp(event, "START")) tilt.recenterYaw();
         if (!mcx.queueEvent(event)) Serial.printf("[MCX] Rejected/dropped event: %s\n", event);
       }
       break;
@@ -323,11 +321,11 @@ static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint3
   if (!wsConnected) return false;
   char json[448];
   const int len = snprintf(json, sizeof(json),
-    "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,\"yawHold\":%.3f,"
+    "{\"type\":\"sensor\",\"pitch\":%.3f,\"roll\":%.3f,"
     "\"tiltValid\":%s,\"joyX\":%.3f,\"joyY\":%.3f,\"fire\":%s,"
     "\"fireSession\":%lu,\"fireCount\":%lu,\"firePending\":%lu,"
     "\"fireHeld\":%s,\"throttle\":%d}",
-    reading.pitch, reading.roll, reading.yaw, reading.yawHold, reading.valid ? "true" : "false", jx, jy,
+    reading.pitch, reading.roll, reading.valid ? "true" : "false", jx, jy,
     presses != lastSentFireCount ? "true" : "false",
     static_cast<unsigned long>(fireSession), static_cast<unsigned long>(presses),
     static_cast<unsigned long>(uint32_t(presses - lastSentFireCount)),
@@ -336,7 +334,7 @@ static bool sendSensorData(const TiltReading &reading, float jx, float jy, uint3
 }
 
 // Recovery is explicit to avoid repeatedly blocking the loop on broken I2C.
-// Serial: c = recalibrate, r = recenter (pitch/roll/yaw), i = reinitialize a reconnected MPU.
+// Serial: c = recalibrate, r = recenter (pitch/roll), i = reinitialize a reconnected MPU.
 // begin() fails when no MPU answers at 0x68 or its WHO_AM_I is unknown.
 static void startTilt() {
   if (!tilt.begin(Wire, 0x68))
@@ -415,7 +413,7 @@ void setup() {
   Wire.setTimeOut(20);
   startTilt();
   Serial.println("[TILT] Keep still near level for about 2.25 seconds");
-  Serial.println("[TILT] Serial commands: c=calibrate, r=recenter (pitch/roll/yaw), i=reinitialize");
+  Serial.println("[TILT] Serial commands: c=calibrate, r=recenter (pitch/roll), i=reinitialize");
   firebaseAvailable = FirebaseWorker::begin(FirebaseWorker::Config{
       FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD, DATABASE_URL, DEVICE_UID});
   if (!firebaseAvailable) {
